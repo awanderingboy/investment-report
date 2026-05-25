@@ -4,9 +4,18 @@ import smtplib
 import schedule
 import time
 import os
-from datetime import datetime
+import json
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 
 # ── 설정 (환경변수 우선) ──────────────────────────────────────────────────────
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY",  "")
@@ -28,6 +37,15 @@ KR_TICKERS = [
     "068270.KS",  # 셀트리온
     "042700.KS",  # 한미반도체
 ]
+INSIDER_TICKERS = ["NVDA", "GOOGL", "FCX", "PLTR", "BEAM", "PWFL", "VOO"]
+FEAR_GREED_CACHE = "/tmp/fear_greed_cache.json"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+SEC_HEADERS = {"User-Agent": "investment-report-bot/1.0 xogus5512@gmail.com"}
 
 
 # ── 환율 조회 ─────────────────────────────────────────────────────────────────
@@ -45,6 +63,352 @@ def get_exchange_rate():
     return 1380.0
 
 
+# ── 거시경제 지표 수집 ─────────────────────────────────────────────────────────
+def get_macro_data():
+    print("  거시경제 지표 수집 중...", flush=True)
+    macro_tickers = {
+        "VIX":  "^VIX",
+        "DXY":  "DX-Y.NYB",
+        "TNX":  "^TNX",
+        "WTI":  "CL=F",
+        "Gold": "GC=F",
+    }
+    results = {}
+    for name, ticker in macro_tickers.items():
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="5d", auto_adjust=True)
+            if hist.empty:
+                print(f"  [{name}] 데이터 없음", flush=True)
+                results[name] = None
+                continue
+            close = hist["Close"].astype(float).dropna()
+            current = close.iloc[-1]
+            change_pct = round((current / close.iloc[-2] - 1) * 100, 2) if len(close) >= 2 else None
+            results[name] = {"value": round(current, 2), "change_pct": change_pct}
+            chg_str = f" ({change_pct:+.2f}%)" if change_pct is not None else ""
+            print(f"  [{name}] {round(current, 2)}{chg_str}", flush=True)
+        except Exception as e:
+            print(f"  [{name}] 수집 실패: {e}", flush=True)
+            results[name] = None
+    return results
+
+
+# ── Fear & Greed Index ────────────────────────────────────────────────────────
+def get_fear_greed():
+    print("  Fear & Greed Index 수집 중...", flush=True)
+
+    # 1순위: CNN
+    try:
+        resp = requests.get(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers=HEADERS, timeout=10
+        )
+        if resp.status_code == 200:
+            fg = resp.json().get("fear_and_greed", {})
+            score = fg.get("score")
+            rating = fg.get("rating", "")
+            if score is not None:
+                result = {"score": round(float(score), 1), "rating": rating, "source": "CNN"}
+                with open(FEAR_GREED_CACHE, "w") as f:
+                    json.dump(result, f)
+                print(f"  Fear&Greed (CNN): {result['score']} / {result['rating']}", flush=True)
+                return result
+    except Exception as e:
+        print(f"  Fear&Greed CNN 실패: {e}", flush=True)
+
+    # 2순위: alternative.me
+    try:
+        resp = requests.get("https://api.alternative.me/fng/", headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            entry = resp.json()["data"][0]
+            score = int(entry["value"])
+            rating = entry["value_classification"]
+            result = {"score": score, "rating": rating, "source": "alternative.me"}
+            with open(FEAR_GREED_CACHE, "w") as f:
+                json.dump(result, f)
+            print(f"  Fear&Greed (alternative.me): {score} / {rating}", flush=True)
+            return result
+    except Exception as e:
+        print(f"  Fear&Greed alternative.me 실패: {e}", flush=True)
+
+    # 3순위: 캐시
+    try:
+        with open(FEAR_GREED_CACHE, "r") as f:
+            cached = json.load(f)
+        cached["cached"] = True
+        print(f"  Fear&Greed 캐시 사용: {cached['score']} / {cached['rating']}", flush=True)
+        return cached
+    except Exception:
+        print("  Fear&Greed 모든 소스 실패", flush=True)
+        return None
+
+
+# ── SEC 내부자 거래 수집 ──────────────────────────────────────────────────────
+def get_insider_trades():
+    print("  SEC 내부자 거래 수집 중...", flush=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    all_trades = []
+
+    for ticker in INSIDER_TICKERS:
+        collected = False
+
+        # 1순위: SEC EDGAR full-text search
+        try:
+            url = (
+                f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
+                f"&dateRange=custom&startdt={week_ago}&enddt={today}&forms=4"
+            )
+            resp = requests.get(url, headers=SEC_HEADERS, timeout=10)
+            if resp.status_code == 200:
+                hits = resp.json().get("hits", {}).get("hits", [])
+                for hit in hits[:3]:
+                    src = hit.get("_source", {})
+                    names = src.get("display_names", [""])
+                    all_trades.append({
+                        "ticker": ticker,
+                        "date": src.get("period_of_report", ""),
+                        "name": names[0] if names else "",
+                        "form": "Form 4",
+                        "source": "SEC EDGAR",
+                    })
+                if hits:
+                    print(f"  [{ticker}] EDGAR {len(hits)}건", flush=True)
+                    collected = True
+        except Exception as e:
+            print(f"  [{ticker}] EDGAR 실패: {e}", flush=True)
+
+        # 2순위: SEC RSS Atom
+        if not collected:
+            try:
+                url = (
+                    f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
+                    f"&CIK={ticker}&type=4&dateb=&owner=include&count=5&output=atom"
+                )
+                resp = requests.get(url, headers=SEC_HEADERS, timeout=10)
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.text)
+                    ns = {"atom": "http://www.w3.org/2005/Atom"}
+                    for entry in root.findall("atom:entry", ns)[:3]:
+                        updated = entry.findtext("atom:updated", "", ns)[:10]
+                        if updated >= week_ago:
+                            all_trades.append({
+                                "ticker": ticker,
+                                "date": updated,
+                                "name": entry.findtext("atom:title", "", ns),
+                                "form": "Form 4",
+                                "source": "SEC RSS",
+                            })
+                    print(f"  [{ticker}] SEC RSS 완료", flush=True)
+                    collected = True
+            except Exception as e:
+                print(f"  [{ticker}] SEC RSS 실패: {e}", flush=True)
+
+        # 3순위: OpenInsider
+        if not collected and BS4_AVAILABLE:
+            try:
+                resp = requests.get(
+                    f"https://openinsider.com/screener?s={ticker}&fd=7",
+                    headers=HEADERS, timeout=10
+                )
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    table = soup.find("table", {"class": "tinytable"})
+                    if table:
+                        for row in table.find_all("tr")[1:4]:
+                            cols = row.find_all("td")
+                            if len(cols) > 6:
+                                all_trades.append({
+                                    "ticker": ticker,
+                                    "date": cols[1].text.strip(),
+                                    "name": cols[3].text.strip(),
+                                    "trade_type": cols[6].text.strip(),
+                                    "form": "Form 4",
+                                    "source": "OpenInsider",
+                                })
+                    print(f"  [{ticker}] OpenInsider 완료", flush=True)
+            except Exception as e:
+                print(f"  [{ticker}] OpenInsider 실패: {e}", flush=True)
+
+    if not all_trades:
+        print("  내부자 거래 수집 실패 (모든 소스)", flush=True)
+        return None
+    return all_trades[:20]
+
+
+# ── 정치인 거래 수집 ──────────────────────────────────────────────────────────
+def get_congress_trades():
+    print("  정치인 거래 수집 중...", flush=True)
+
+    # 1순위: Unusual Whales
+    try:
+        resp = requests.get(
+            "https://api.unusualwhales.com/api/congress/trades",
+            headers=HEADERS, timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            trades = data.get("data", data if isinstance(data, list) else [])[:10]
+            if trades:
+                print(f"  정치인 거래 (Unusual Whales): {len(trades)}건", flush=True)
+                return trades
+    except Exception as e:
+        print(f"  Unusual Whales 실패: {e}", flush=True)
+
+    # 2순위: Quiver Quant
+    try:
+        resp = requests.get(
+            "https://api.quiverquant.com/beta/live/congresstrading",
+            headers=HEADERS, timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            trades = data[:10] if isinstance(data, list) else []
+            if trades:
+                print(f"  정치인 거래 (Quiver Quant): {len(trades)}건", flush=True)
+                return trades
+    except Exception as e:
+        print(f"  Quiver Quant 실패: {e}", flush=True)
+
+    # 3순위: Capitol Trades 스크래핑
+    if BS4_AVAILABLE:
+        try:
+            resp = requests.get(
+                "https://www.capitoltrades.com/trades",
+                headers=HEADERS, timeout=15
+            )
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                trades = []
+                for row in soup.select("table tbody tr")[:10]:
+                    cols = row.find_all("td")
+                    if len(cols) >= 4:
+                        trades.append({
+                            "politician":  cols[0].text.strip(),
+                            "ticker":      cols[1].text.strip(),
+                            "trade_type":  cols[2].text.strip(),
+                            "date":        cols[3].text.strip(),
+                        })
+                if trades:
+                    print(f"  정치인 거래 (Capitol Trades): {len(trades)}건", flush=True)
+                    return trades
+        except Exception as e:
+            print(f"  Capitol Trades 실패: {e}", flush=True)
+
+    print("  정치인 거래 수집 실패 (모든 소스)", flush=True)
+    return None
+
+
+# ── Put/Call Ratio 수집 ───────────────────────────────────────────────────────
+def get_put_call_ratio(vix_value=None):
+    print("  Put/Call Ratio 수집 중...", flush=True)
+
+    # 1순위: CBOE
+    if BS4_AVAILABLE:
+        try:
+            resp = requests.get(
+                "https://www.cboe.com/us/options/market_statistics/daily/",
+                headers=HEADERS, timeout=10
+            )
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for row in soup.find_all("tr"):
+                    cells = row.find_all("td")
+                    if cells and "total" in cells[0].text.lower():
+                        try:
+                            ratio = float(cells[-1].text.strip())
+                            print(f"  Put/Call Ratio (CBOE): {ratio}", flush=True)
+                            return {"ratio": ratio, "source": "CBOE"}
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"  CBOE 실패: {e}", flush=True)
+
+    # 2순위: MarketWatch
+    if BS4_AVAILABLE:
+        try:
+            resp = requests.get(
+                "https://www.marketwatch.com/investing/index/vix",
+                headers=HEADERS, timeout=10
+            )
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for tag in soup.find_all(string=lambda t: t and "put" in t.lower() and "call" in t.lower()):
+                    try:
+                        ratio = float(tag.parent.find_next("span").text.strip())
+                        print(f"  Put/Call Ratio (MarketWatch): {ratio}", flush=True)
+                        return {"ratio": ratio, "source": "MarketWatch"}
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"  MarketWatch 실패: {e}", flush=True)
+
+    # 3순위: VIX 기반 추정
+    if vix_value is not None:
+        if vix_value >= 30:
+            ratio, interp = 1.2, "Put 우세 (VIX 공포 구간 기반 추정)"
+        elif vix_value >= 20:
+            ratio, interp = 0.9, "중립 (VIX 주의 구간 기반 추정)"
+        else:
+            ratio, interp = 0.7, "Call 우세 (VIX 안정 구간 기반 추정)"
+        print(f"  Put/Call Ratio VIX 추정: {ratio}", flush=True)
+        return {"ratio": ratio, "source": f"VIX 추정({vix_value})", "interpretation": interp}
+
+    print("  Put/Call Ratio 수집 실패 (모든 소스)", flush=True)
+    return None
+
+
+# ── 데이터 포맷 헬퍼 ──────────────────────────────────────────────────────────
+def _fmt_macro(macro_data):
+    if not macro_data:
+        return "⚠️ 거시경제 데이터 수집 실패"
+    labels = {"VIX": "VIX(변동성)", "DXY": "DXY(달러인덱스)", "TNX": "10년 국채금리(%)", "WTI": "WTI 원유($/배럴)", "Gold": "금($/oz)"}
+    lines = []
+    for key, label in labels.items():
+        val = macro_data.get(key)
+        if val:
+            chg = f" ({val['change_pct']:+.2f}%)" if val.get("change_pct") is not None else ""
+            lines.append(f"- {label}: {val['value']}{chg}")
+        else:
+            lines.append(f"- {label}: ⚠️ 수집 실패")
+    return "\n".join(lines)
+
+def _fmt_fear_greed(fg):
+    if not fg:
+        return "⚠️ Fear & Greed 데이터 수집 실패 - 수동 확인 필요"
+    cached = " (캐시 사용)" if fg.get("cached") else f" / 출처: {fg.get('source','')}"
+    return f"점수: {fg['score']}/100 / 등급: {fg['rating']}{cached}"
+
+def _fmt_insider(trades):
+    if not trades:
+        return "⚠️ 내부자 거래 데이터 수집 실패 - 수동 확인 필요"
+    lines = []
+    for t in trades[:10]:
+        trade_type = t.get("trade_type", t.get("form", ""))
+        lines.append(f"- [{t.get('ticker','')}] {t.get('date','')} / {t.get('name','')} / {trade_type} (출처: {t.get('source','')})")
+    return "\n".join(lines)
+
+def _fmt_congress(trades):
+    if not trades:
+        return "⚠️ 정치인 거래 데이터 수집 실패 - 수동 확인 필요"
+    lines = []
+    for t in trades[:10]:
+        if isinstance(t, dict):
+            politician = t.get("politician", t.get("name", ""))
+            ticker = t.get("ticker", t.get("symbol", ""))
+            trade_type = t.get("trade_type", t.get("transaction", ""))
+            date = t.get("date", t.get("transaction_date", ""))
+            lines.append(f"- {politician} / {ticker} / {trade_type} / {date}")
+    return "\n".join(lines) if lines else "⚠️ 정치인 거래 내역 없음"
+
+def _fmt_pcr(pcr):
+    if not pcr:
+        return "⚠️ Put/Call Ratio 수집 실패 - 수동 확인 필요"
+    interp = f" / {pcr['interpretation']}" if pcr.get("interpretation") else ""
+    return f"{pcr['ratio']} (출처: {pcr['source']}){interp}"
+
+
 # ── 기술적 지표 계산 ──────────────────────────────────────────────────────────
 def _calc_rsi(close, period=14):
     if len(close) < period + 1:
@@ -55,9 +419,7 @@ def _calc_rsi(close, period=14):
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi.iloc[-1], 1)
-
+    return round((100 - (100 / (1 + rs))).iloc[-1], 1)
 
 def _calc_macd(close):
     if len(close) < 26:
@@ -68,21 +430,17 @@ def _calc_macd(close):
     signal = macd.ewm(span=9, adjust=False).mean()
     return round(macd.iloc[-1], 4), round(signal.iloc[-1], 4)
 
-
 def _calc_ma(close, period):
     if len(close) >= period:
         return round(close.rolling(period).mean().iloc[-1], 2)
     return None
 
-
 def _calc_volume_ratio(volume):
     if len(volume) < 20:
         return None
-    avg5 = volume.iloc[-5:].mean()
+    avg5  = volume.iloc[-5:].mean()
     avg20 = volume.iloc[-20:].mean()
-    if avg20 == 0:
-        return None
-    return round(avg5 / avg20, 2)
+    return round(avg5 / avg20, 2) if avg20 > 0 else None
 
 
 # ── 현재가 수집 ───────────────────────────────────────────────────────────────
@@ -135,7 +493,6 @@ def get_stock_data(tickers):
                 print(f"    [{ticker}] 현재가 수집 실패, 건너뜀", flush=True)
                 continue
 
-            # NaN 제거 + float 변환 → rolling/ewm 계산 안정화
             if not hist.empty:
                 close  = hist["Close"].astype(float).dropna()
                 volume = hist["Volume"].astype(float).fillna(0)
@@ -152,15 +509,13 @@ def get_stock_data(tickers):
                     return (current_price / close.iloc[-days] - 1) * 100
                 return None
 
-            # 기술적 지표 계산
             ma5   = _calc_ma(close, 5)   if close is not None else None
             ma20  = _calc_ma(close, 20)  if close is not None else None
             ma60  = _calc_ma(close, 60)  if close is not None else None
             ma120 = _calc_ma(close, 120) if close is not None else None
 
             aligned = (
-                ma5 is not None and ma20 is not None and
-                ma60 is not None and ma120 is not None and
+                all(v is not None for v in [ma5, ma20, ma60, ma120]) and
                 ma5 > ma20 > ma60 > ma120
             )
             golden_cross = (ma5 is not None and ma20 is not None and ma5 > ma20)
@@ -171,7 +526,6 @@ def get_stock_data(tickers):
                 macd_val is not None and macd_signal is not None and
                 macd_val > macd_signal
             )
-
             vol_ratio = _calc_volume_ratio(volume) if volume is not None else None
 
             results[ticker] = {
@@ -188,11 +542,7 @@ def get_stock_data(tickers):
                 "매출성장률": info.get("revenueGrowth", "N/A"),
                 "영업이익률": info.get("operatingMargins", "N/A"),
                 "ROE": info.get("returnOnEquity", "N/A"),
-                # 기술적 지표
-                "MA5": ma5,
-                "MA20": ma20,
-                "MA60": ma60,
-                "MA120": ma120,
+                "MA5": ma5, "MA20": ma20, "MA60": ma60, "MA120": ma120,
                 "정배열": aligned,
                 "골든크로스(MA5>MA20)": golden_cross,
                 "RSI14": rsi,
@@ -209,7 +559,9 @@ def get_stock_data(tickers):
 
 
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
-def generate_report(us_data, kr_data, exchange_rate):
+def generate_report(us_data, kr_data, exchange_rate,
+                    macro_data, fear_greed, insider_trades,
+                    congress_trades, put_call_ratio):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today = datetime.now().strftime("%Y년 %m월 %d일")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -217,168 +569,234 @@ def generate_report(us_data, kr_data, exchange_rate):
     static_system = """너는 500만원에서 시작해 자산 10억 이상을 달성한 전문 퀀트 트레이더이자 포트폴리오 매니저다.
 목표는 단 하나 — 사용자가 최대한 많은 돈을 버는 것.
 감정 없이 냉정하게, 데이터와 확률 기반으로 분석하라.
-단, 손실 = 손절이 아님을 명심하라. 근거가 살아있으면 홀딩, 근거가 무너지면 손절.
+손실 = 손절이 아님을 명심하라. 근거가 살아있으면 홀딩, 근거가 무너지면 손절.
 
-[내 포트폴리오 현황]
-※ 카테고리 구분
-- 장기 적립식 (매일 자동 매수, 절대 단기 매도 금지): GOOGL, FCX, VOO
-- 500만원 1억 프로젝트 종목: 셀트리온제약, 카카오, 네이버, BEAM, NVDA, PLTR, PWFL
-- 500만원 1억 프로젝트 시드: 현금 500만원 (별도 분리 운용)
+[포트폴리오 카테고리 - 3가지로 완전히 분리]
 
-국내:
-- 셀트리온제약: 평단 68,287원 / 398주 / 현재가 51,900원
-- 카카오: 평단 36,151원 / 104주 / 현재가 42,000원
-- 네이버: 평단 214,000원 / 50주 / 현재가 203,000원
+카테고리 1 - 주식 모으기 중 (매일 자동 적립, 절대 단기 매도 금지):
+- 알파벳A(GOOGL): 평단 $325.10 / 2.77주 / 매일 $25 적립
+- 프리포트맥모란(FCX): 평단 $61.53 / 12.84주 / 매일 $10 적립
+- VOO: 평단 $621.68 / 3.39주 / 매일 $20 적립
 
-미국:
-- 빔 테라퓨틱스(BEAM): 평단 $32.49 / 100주 / 현재가 $28.64
-- 엔비디아(NVDA): 평단 $178.84 / 10주 / 현재가 $215.00
-- 팔란티어(PLTR): 평단 $142.36 / 11.64주 / 현재가 $136.88
-- 파워플리트(PWFL): 평단 $3.68 / 1200주 / 현재가 $3.41
-- 알파벳A(GOOGL): 평단 $325.10 / 2.77주 / 현재가 $382.97 (매일 $25 적립 중)
-- 프리포트맥모란(FCX): 평단 $61.53 / 12.84주 / 현재가 $61.99 (매일 $10 적립 중)
-- VOO: 평단 $621.68 / 3.39주 / 현재가 $685.55 (매일 $20 적립 중)
+카테고리 2 - 현재 보유 중 (적립 없음, 매매 판단 필요):
+- 셀트리온제약: 평단 68,287원 / 398주
+- 카카오: 평단 36,151원 / 104주
+- 네이버: 평단 214,000원 / 50주
+- 빔 테라퓨틱스(BEAM): 평단 $32.49 / 100주
+- 엔비디아(NVDA): 평단 $178.84 / 10주
+- 팔란티어(PLTR): 평단 $142.36 / 11.64주
+- 파워플리트(PWFL): 평단 $3.68 / 1200주
 
-보유 현금: 13,585,062원 + $3,566
-500만원 1억 프로젝트 전용 시드: 500만원 (위 현금에서 별도 분리 운용)
+카테고리 3 - 500만원 프로젝트 (아직 미투자, AI가 종목 추천):
+- 시드: 현금 500만원 (다른 포트폴리오와 완전 분리)
+- 목표: 6개월마다 2배, 최종 목표 1억
+- 현재 단계: 1단계 (500만원 → 1,000만원)
+
+보유 현금: 13,585,062원 + $3,566 (500만원 프로젝트 시드 별도)
 
 아래 형식으로 보고서를 작성하라. 반드시 HTML로 작성하라.
 
 <h2>📊 오늘의 시장 총평</h2>
 미국/국내 시장 전체 분위기, 주요 이슈, 섹터 흐름 3~5줄.
-오늘 주목해야 할 핵심 변수 1가지를 굵게 강조하라.
+오늘 주목해야 할 핵심 변수 1가지를 <strong>굵게</strong> 강조하라.
+
+<h2>🌍 거시경제 & 시장 심리</h2>
+수집된 실제 데이터를 기반으로 아래 항목을 빠짐없이 작성하라:
+- Fear & Greed Index: 수치, 등급, 의미 해석
+- VIX: 수치와 시장 공포 수준 (20 이하=안정, 20~30=주의, 30 이상=공포)
+- Put/Call Ratio: 수치와 기관 방향성 해석 (1.0 이상=하락 베팅 우세)
+- DXY 달러 인덱스: 수치, 강달러/약달러 여부, 주식시장 영향
+- 미국 10년 국채 금리: 수치, 성장주/가치주에 미치는 영향
+- 원유(WTI): 수치, 인플레이션 및 에너지 섹터 영향
+- 금: 수치, 안전자산 수요 해석
+- 데이터 수집 실패 항목은 ⚠️ 표시 후 수동 확인 안내
+종합 판단: 지금 시장이 아래 셋 중 하나로 명확하게 결론 내려라
+  🟢 매수 우위 / 🟡 관망 / 🔴 리스크 회피
+
+<h2>🏛️ 내부자 거래 & 정치인 동향</h2>
+수집된 실제 데이터 기반으로:
+- SEC 내부자 거래: 종목별 CEO/임원 자사주 매수/매도 내역
+  매수 = 🟢 강한 상승 신호, 매도 = 🔴 주의 신호로 해석
+- 정치인 거래: 최근 거래 내역, 방향성 해석
+- 보유 종목(NVDA, GOOGL, FCX, PLTR, BEAM, PWFL, VOO) 관련 내용은
+  반드시 ⚠️ 표시하고 굵게 강조
+- 데이터 수집 실패 항목은 ⚠️ 표시 후 수동 확인 안내
 
 <h2>💼 내 포트폴리오 진단</h2>
-각 보유 종목을 표로 작성:
-- 종목명 / 평단 / 현재가 / 수익률(%) / 평가손익 / RSI / MA정배열 여부
-- 판단: 홀딩 / 추가매수 / 비중축소 / 손절 중 하나
-- 판단 기준: 반드시 "근거가 살아있는가"로 판단하라.
-  * 손실 중이어도 성장 스토리, 기술적 지지, 실적 모멘텀이 유효하면 홀딩 or 추가매수
-  * 손절은 오직 "투자 근거 자체가 무너진 경우"에만 권고
-  * SK하이닉스가 -50%여도 HBM 스토리가 살아있으면 홀딩이 정답이었던 것처럼
-- 손절 트리거 (가격 기준이 아닌 근거 기반): "이 조건이 깨지면 손절"
-- 목표가: 단기(3개월) / 중기(1년) / 장기(3년) 구분
-전체 포트폴리오 총 평가금액 (실시간 환율 적용), 총 손익, 현금 포함 총자산.
+카테고리 1과 카테고리 2를 각각 별도 표로 작성.
+각 종목마다 아래 항목을 빠짐없이 모두 작성하라.
+데이터가 없으면 "N/A"라고 써라. 절대 항목을 생략하지 마라:
+- 종목명
+- 평단가
+- 현재가
+- 수익률(%)
+- 평가손익 (원화 환산, 환율 적용)
+- RSI14 수치
+- MA 정배열 여부 (True/False)
+- 거래량 비율 (최근 5일/20일 평균 대비, 예: 1.3배)
+- 영업이익률 (%, 없으면 N/A)
+- 매출성장률 (%, 없으면 N/A)
+- PER (없으면 N/A)
+- 판단: 반드시 아래 5가지 중 하나로만 표현
+  🔴 즉시매도 / 🟠 비중축소 / 🟡 홀딩 / 🟢 추가매수 / 💎 강력매수
+- 판단 근거: 2~3줄 핵심만
+- 기회비용: 이 종목 보유 중 포기하는 다른 기회 명시
+- 손절 트리거: "이 조건이 깨지면 손절" (가격 기준 아닌 근거 기반)
+- 목표가: 단기(3개월) / 중기(1년)
+
+판단 원칙:
+- 🔴즉시매도와 💎강력매수는 반드시 굵은 글씨로 강조하고 이유 상세히 작성
+- "검토해볼 만하다" "고려해볼 수 있다" 같은 모호한 표현 절대 금지
+- 매도해야 하면 "지금 당장 매도하라"
+- 매수해야 하면 "지금 바로 매수하라"
+- 손실 확정이 필요한 종목은 "기회비용 X원, 지금 정리하고 Y종목으로 이동 권고"로 명시
+- 장기 보유가 필요한 종목은 "최소 X개월 보유 전략"으로 명시
 
 PWFL(파워플리트)의 경우:
 - "AI 텔레매틱스 스토리"를 근거로 홀딩을 권고하려면
-  반드시 수집된 실제 데이터(매출성장률, 영업이익률, RSI, MA배열)로
-  근거를 뒷받침해야 한다.
-- 실제 데이터상 모멘텀이 없으면 기회비용을 명시하고
-  더 나은 종목으로의 교체를 적극 검토하라.
-- 감정적 홀딩(손실이 확정되기 싫어서 버티는 것)과
-  근거 기반 홀딩을 명확히 구분하라.
+  반드시 수집된 실제 데이터(매출성장률, 영업이익률, RSI, MA배열)로 뒷받침해야 한다.
+- 실제 데이터상 모멘텀이 없으면 기회비용을 명시하고 더 나은 종목으로의 교체를 적극 검토하라.
+- 감정적 홀딩(손실 확정이 싫어서 버티는 것)과 근거 기반 홀딩을 명확히 구분하라.
+
+전체 포트폴리오 총 평가금액 (실시간 환율 적용), 총 손익, 현금 포함 총자산 계산.
 
 <h2>🔍 기술적 분석 기반 추천 종목 (단기 스윙)</h2>
 수집된 실제 데이터 기반으로 기술적으로 매력적인 종목 3개.
-각 종목마다 반드시 수집된 실제 수치를 사용해서 작성하라:
-- 이동평균선 배열 (MA5/MA20/MA60/MA120 실제 값 명시, 정배열 여부)
-- 거래량 비율 (실제 계산된 값: 최근5일/20일평균)
-- RSI 실제 값 및 해석 (70 이상=과매수, 30 이하=과매도)
-- MACD 골든크로스/데드크로스 여부 (실제 계산값)
+각 종목마다 아래 항목을 빠짐없이 작성하라. 없으면 N/A:
+- 종목명 및 현재가
+- RSI14 실제 수치 및 해석
+- MA5/MA20/MA60/MA120 실제 값 및 정배열 여부
+- 거래량 비율 (실제 계산값, 20일 평균 대비 몇 배)
+- 영업이익률 / 매출성장률
+- MACD 골든크로스/데드크로스 여부
 - 주요 지지/저항 구간
 - 왜 지금인가 (위 데이터 종합 결론)
-- 매수가 / 1차 목표가 / 2차 목표가 / 손절 트리거 (근거 기반)
+- 매수가 / 1차 목표가 / 2차 목표가
+- 손절 트리거 (근거 기반)
 - 예상 수익률 및 기간
 
-<h2>📰 뉴스+기업분석 기반 추천 종목 (중장기 성장주 발굴)</h2>
-반드시 아직 시장에 덜 알려진 소형~중형주를 발굴하라.
-엔비디아, SK하이닉스처럼 초기 저평가됐지만 폭발적 성장한 유형이 목표.
+<h2>📰 중장기 성장주 발굴</h2>
+시장에 덜 알려진 소형~중형주 발굴.
+엔비디아/SK하이닉스처럼 초기 저평가됐지만 폭발적 성장한 유형이 목표.
 AI/반도체/바이오/에너지전환/방산/양자컴퓨팅/UAM 등 메가트렌드 수혜주 우선.
 삼성전자, 애플, 구글, MS 같은 대형주는 이 섹션에 넣지 마라.
-각 종목마다:
-- 왜 지금 저평가인가 (구체적 수치: 시총, PSR, PER 등)
-- 핵심 성장 스토리 (기술적 우위, 시장 독점, 규제 수혜 등)
+각 종목마다 빠짐없이 작성하라. 없으면 N/A:
+- 종목명 및 현재가
+- 시총 / PER / PSR
+- 영업이익률 / 매출성장률
+- RSI14 / 거래량 비율
+- 왜 지금 저평가인가 (구체적 수치)
+- 핵심 성장 스토리
 - 트리거: 언제 주가가 움직이는가 (구체적 이벤트)
 - 목표가 (6개월 / 1년 / 3년)
 - 손절 트리거 (근거 기반)
 - 리스크 요인
+- 멀티배거 가능성 있으면 반드시 🔥 표시
 
-<h2>🚀 500만원 → 1억 만들기 프로젝트</h2>
-목표: 시드 500만원으로 1억 달성 (수익률 1,900%).
-전략: 6개월 단위 수익률 100% 달성 → 복리로 1억.
+<h2>🚀 500만원 → 1억 프로젝트 (카테고리 3)</h2>
+목표: 시드 500만원으로 1억 달성.
+전략: 6개월 단위 2배 복리.
 1단계(~6개월): 500만원 → 1,000만원
 2단계(~12개월): 1,000만원 → 2,000만원
 3단계(~18개월): 2,000만원 → 4,000만원
 4단계(~24개월): 4,000만원 → 1억
 
-운용 원칙:
-- 시드 500만원은 다른 포트폴리오와 완전 분리 운용
-- 확신도에 따라 비중 유동 배분
-  → 멀티배거 가능 종목: 시드의 50~80%까지 집중 가능
-  → 확신 낮은 종목: 10~20% 소액 분산
-- 손절은 "근거 붕괴 시"에만. 단순 하락은 손절 이유가 아님
-- 6개월 내 2배가 목표. 이를 위한 리스크는 감수
-- 멀티배거 후보 발견 시 집중 투자 전략
-- 시드 전액 손실만 방어
-
-전문 퀀트 트레이더 관점에서:
-- 현재 단계 진단 및 이번 달 전략
-- 지금 당장 500만원으로 공략할 종목 3개
-  (6개월~1년 내 2~10배 가능 종목 발굴, 수집 데이터 종목 우선)
-  각 종목: 진입가 / 6개월 목표가 / 1년 목표가 / 손절 트리거(근거 기반) / 투입 비중 / 핵심 근거
-- 기존 프로젝트 종목 진단 (셀트리온제약/카카오/네이버/BEAM/NVDA/PLTR/PWFL):
-  * 손실 중이어도 근거가 살아있으면 홀딩 또는 추가매수 권고 가능
-  * 근거가 무너진 종목만 손절 or 갈아타기 권고
-  * 각 종목별 "이 근거가 무너지면 손절" 조건 명시
-- 리스크 시나리오: 시드 반토막 시 대응 전략
+이 섹션은 카테고리 1, 2와 완전히 분리해서 분석하라.
+기존 보유 종목은 언급하지 말고, 오직 500만원으로 새로 진입할 종목만 추천하라.
+각 추천 종목마다 빠짐없이 작성하라. 없으면 N/A:
+- 종목명 및 현재가
+- 시총 / PER / PSR
+- 영업이익률 / 매출성장률
+- RSI14 / 거래량 비율
+- 핵심 성장 스토리 (2~10배 가능한 이유)
+- 진입가 / 6개월 목표가 / 1년 목표가
+- 손절 트리거 (근거 기반)
+- 투입 비중 추천 (500만원 중 몇 %)
+- 멀티배거 가능성 있으면 🔥 표시
+현재 단계 진단 및 이번 달 전략 포함.
+리스크 시나리오: 시드 반토막 시 대응 전략.
 
 <h2>⭐ 종합 추천 TOP 3</h2>
-기술적 + 펀더멘털 모두 좋은 종목 3개.
-멀티배거 가능 종목은 반드시 🔥 표시.
-단기/중기/장기 구분, 목표가 3단계, 손절 트리거 명시.
+기술적 + 펀더멘털 + 거시경제 종합 최선의 종목 3개.
+멀티배거 가능 종목은 🔥 표시.
+각 종목:
+- 추천 이유 한 줄 핵심
+- 매수 전략 (분할/일괄, 구체적 가격)
+- 목표가 3단계 / 손절 트리거
+- 리스크 한 줄 요약
 
 <h2>⚡ 단타 추천 (오늘~1주일)</h2>
-수집된 실제 기술적 데이터 기반 단기 종목 2~3개.
-진입가 / 목표가 / 손절 트리거 / 예상 수익률 명시.
+실제 기술적 데이터 기반 단기 종목 2~3개.
+각 종목: 진입가 / 목표가 / 손절 트리거 / 예상 수익률 / 근거
 
 <h2>🚫 지금 피해야 할 것들</h2>
 위험 종목, 과열 섹터, 주의 이슈. 이유 포함.
 
 <h2>💡 오늘의 액션 플랜</h2>
-지금 당장 해야 할 행동 3~5가지. 구체적 가격과 수량 포함.
+지금 당장 해야 할 행동 3~5가지.
+반드시 구체적인 종목명, 가격, 수량 포함.
+🔴 긴급 / 🟡 오늘 중 / 🔵 이번 주 중으로 우선순위 표시.
 
 <h2>📅 이번 주 핵심 이벤트</h2>
-주가에 영향을 줄 이벤트. 날짜 / 이벤트 / 예상 영향 포함.
+날짜 / 이벤트 / 예상 영향 / 관련 보유 종목 포함.
 
-종목 추천 시 목표주가 설정 원칙:
+<h2>📊 전체 종목 종합 스코어카드</h2>
+보유 중인 모든 종목 + 오늘 추천 종목을 하나의 HTML 테이블로 정리.
+컬럼 구성:
+| 종목 | 현재가 | RSI | 정배열 | 거래량비율 | 영업이익률 | 매출성장률 | PER | 판단 | 단기목표가 | 종합점수(100점) |
+
+점수 기준:
+- 기술적 점수 (RSI, MA, 거래량): 30점
+- 펀더멘털 (영업이익률, 매출성장, PER): 30점
+- 모멘텀 (수익률 추세): 20점
+- 리스크 대비 기대수익: 20점
+
+점수별 셀 배경색:
+- 80점 이상: background-color: #d4edda (초록)
+- 60~79점: background-color: #fff3cd (노랑)
+- 59점 이하: background-color: #f8d7da (빨강)
+
+[전체 공통 원칙]
+판단 표현 원칙:
+- 🔴즉시매도와 💎강력매수는 절대 애매하게 표현하지 마라
+- "검토해볼 만하다" "고려해볼 수 있다" 같은 모호한 표현 금지
+- 매도해야 하면 "지금 당장 매도하라"
+- 매수해야 하면 "지금 바로 매수하라"
+- 큰 수익 기회가 보이면 근거와 함께 명확하게 표현
+- 장기 보유가 필요한 종목은 "최소 X개월 보유 전략"으로 명시
+- 손실 확정이 필요한 종목은 "기회비용 X원, 지금 정리하고 Y종목으로 이동 권고"로 명시
+
+목표주가 설정 원칙:
 - 획일적 -10%손절/+20%익절 금지
-- 단기 스윙: 기술적 저항선 기반 목표가
-- 중장기 성장주: 6개월/1년/3년 목표가 각각 제시
-- 🔥 멀티배거 후보: 매수 후 보유 전략, 중간 익절 구간, 최종 목표가 상세 제시
+- 단기 스윙: 기술적 저항선 기반
+- 중장기 성장주: 6개월/1년/3년 목표가 각각
+- 🔥 멀티배거 후보: 매수 후 보유 전략, 중간 익절 구간, 최종 목표가 상세히
 - 손절 트리거는 반드시 "근거 붕괴 조건"으로 명시 (단순 % 하락 금지)
-- 구조적 성장 종목은 손절가 타이트하게, 목표가는 과감하게
 
-냉정하고 솔직하게 작성하라. 손실 중인 종목도 근거가 있으면 당당히 홀딩을 권고하라.
-멀티배거 가능성이 있으면 근거와 함께 과감히 추천하라.
-수집된 실제 데이터를 최대한 활용하고, 추정치를 사용할 경우 반드시 "(추정)"으로 표시하라.
+뉴스, 기업 이벤트 등 실시간 미확인 정보는 (※AI 학습 데이터 기반) 표시.
+수집된 실제 데이터(주가, RSI, MA, 거래량 등)에는 표시 붙이지 않는다.
+데이터 수집 실패 항목은 보고서 내 ⚠️ 표시 후 수동 확인 안내."""
 
-뉴스, 기업 이벤트, 계약 내용 등 실시간 확인이 불가한 정보를 사용할 경우
-반드시 해당 내용 뒤에 "(※ AI 학습 데이터 기반, 최신 뉴스 직접 확인 필요)"
-라고 표시하라. 수집된 실제 데이터(주가, RSI, MA, 거래량 등)에는 이 표시를
-붙이지 않는다."""
+    user_content = (
+        f"오늘 날짜: {today}\n"
+        f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
+        f"실시간 환율: {exchange_rate}원/달러\n\n"
+        f"[거시경제 지표]\n{_fmt_macro(macro_data)}\n\n"
+        f"[Fear & Greed Index]\n{_fmt_fear_greed(fear_greed)}\n\n"
+        f"[Put/Call Ratio]\n{_fmt_pcr(put_call_ratio)}\n\n"
+        f"[SEC 내부자 거래 (최근 7일)]\n{_fmt_insider(insider_trades)}\n\n"
+        f"[정치인 거래 (최근)]\n{_fmt_congress(congress_trades)}\n\n"
+        f"[미국 주식 데이터]\n{us_data}\n\n"
+        f"[국내 주식 데이터]\n{kr_data}"
+    )
 
     print("  [Claude API] 스트리밍 요청 시작...", flush=True)
     with client.messages.stream(
         model="claude-opus-4-7",
         max_tokens=16000,
         thinking={"type": "adaptive"},
-        system=[{
-            "type": "text",
-            "text": static_system,
-            "cache_control": {"type": "ephemeral"}
-        }],
-        messages=[{
-            "role": "user",
-            "content": (
-                f"오늘 날짜: {today}\n"
-                f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
-                f"실시간 환율: {exchange_rate}원/달러\n\n"
-                f"[수집된 시장 데이터]\n"
-                f"미국 주식: {us_data}\n\n"
-                f"국내 주식: {kr_data}"
-            )
-        }]
+        system=[{"type": "text", "text": static_system, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user_content}]
     ) as stream:
         for event in stream:
             event_type = type(event).__name__
@@ -395,7 +813,6 @@ AI/반도체/바이오/에너지전환/방산/양자컴퓨팅/UAM 등 메가트�
     for block in final.content:
         if block.type == "text":
             return block.text
-
     return ""
 
 
@@ -416,7 +833,10 @@ def send_email(report_content):
         <style>
             body {{ font-family: 'Malgun Gothic', sans-serif; line-height: 1.6; color: #333; }}
             h1, h2, h3 {{ color: #1a1a2e; }}
-            .container {{ max-width: 860px; margin: 0 auto; padding: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 13px; }}
+            th {{ background-color: #1a1a2e; color: white; }}
+            .container {{ max-width: 900px; margin: 0 auto; padding: 20px; }}
             .header {{ background: linear-gradient(135deg, #1a1a2e, #16213e);
                        color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
             .data-time {{ font-size: 12px; color: #ccc; margin-top: 6px; }}
@@ -457,22 +877,40 @@ def run_daily_report():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 보고서 생성 시작", flush=True)
     print(f"{'='*50}", flush=True)
 
-    print(f"\n[0/4] 환율 조회", flush=True)
+    print(f"\n[0/8] 환율 조회", flush=True)
     exchange_rate = get_exchange_rate()
 
-    print(f"\n[1/4] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
+    print(f"\n[1/8] 거시경제 지표 수집 (VIX, DXY, 금리, 원유, 금)", flush=True)
+    macro_data = get_macro_data()
+
+    print(f"\n[2/8] Fear & Greed Index 수집", flush=True)
+    fear_greed = get_fear_greed()
+
+    print(f"\n[3/8] SEC 내부자 거래 수집", flush=True)
+    insider_trades = get_insider_trades()
+
+    print(f"\n[4/8] 정치인 거래 수집", flush=True)
+    congress_trades = get_congress_trades()
+
+    print(f"\n[5/8] Put/Call Ratio 수집", flush=True)
+    vix_val = (macro_data.get("VIX") or {}).get("value")
+    put_call_ratio = get_put_call_ratio(vix_value=vix_val)
+
+    print(f"\n[6/8] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
     us_data = get_stock_data(US_TICKERS)
     print(f"  → 수집 완료: {list(us_data.keys())}", flush=True)
 
-    print(f"\n[2/4] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
+    print(f"\n[6/8] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
     kr_data = get_stock_data(KR_TICKERS)
     print(f"  → 수집 완료: {list(kr_data.keys())}", flush=True)
 
-    print(f"\n[3/4] AI 분석 보고서 생성 (Claude Opus 4.7)", flush=True)
-    report = generate_report(us_data, kr_data, exchange_rate)
+    print(f"\n[7/8] AI 분석 보고서 생성 (Claude Opus 4.7)", flush=True)
+    report = generate_report(us_data, kr_data, exchange_rate,
+                             macro_data, fear_greed, insider_trades,
+                             congress_trades, put_call_ratio)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
 
-    print(f"\n[4/4] 이메일 발송", flush=True)
+    print(f"\n[8/8] 이메일 발송", flush=True)
     send_email(report)
 
     print(f"\n{'='*50}", flush=True)
@@ -482,10 +920,8 @@ def run_daily_report():
 
 if __name__ == "__main__":
     if os.environ.get("GITHUB_ACTIONS"):
-        # GitHub Actions: 한 번만 실행 후 종료
         run_daily_report()
     else:
-        # 로컬: 즉시 1회 실행 후 매일 07:00 자동 실행
         run_daily_report()
         schedule.every().day.at("07:00").do(run_daily_report)
         print("스케줄러 시작 — 매일 07:00 자동 실행")
