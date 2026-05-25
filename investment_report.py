@@ -830,7 +830,7 @@ AI/반도체/바이오/에너지전환/방산/양자컴퓨팅/UAM 등 메가트�
     print("  [Claude API] 스트리밍 요청 시작...", flush=True)
     with client.messages.stream(
         model="claude-opus-4-7",
-        max_tokens=16000,
+        max_tokens=24000,
         thinking={"type": "adaptive"},
         system=[{"type": "text", "text": static_system, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": user_content}]
