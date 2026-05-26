@@ -100,5 +100,35 @@
   "category3_cash": "auto",
   "last_updated": "2026-05-27",
   "category3_seed": 5000000,
-  "last_dca_date": "2026-05-27"
+  "last_dca_date": "2026-05-27",
+  "pending_actions": [
+    {
+      "id": "nvda_split_buy_20260527",
+      "action": "분할매수",
+      "ticker": "NVDA",
+      "name": "엔비디아",
+      "total_units": 3,
+      "done_units": 1,
+      "unit_shares": 1,
+      "start_shares": 10,
+      "unit_amount_usd": 215,
+      "memo": "$210~215 분할 3회",
+      "created_date": "2026-05-27",
+      "status": "진행중"
+    },
+    {
+      "id": "rgti_split_buy_20260527",
+      "action": "분할매수",
+      "ticker": "RGTI",
+      "name": "리게티컴퓨팅",
+      "total_units": 20,
+      "done_units": 0,
+      "unit_shares": 1,
+      "start_shares": 85,
+      "unit_amount_usd": 24.5,
+      "memo": "카테고리3 $24~25 분할",
+      "created_date": "2026-05-27",
+      "status": "진행중"
+    }
+  ]
 }

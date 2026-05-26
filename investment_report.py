@@ -1100,6 +1100,58 @@ def build_yesterdays_verification(all_stock_data: dict, exchange_rate: float) ->
     return "\n".join(lines)
 
 
+def get_pending_actions_summary(portfolio_data: dict) -> str:
+    """진행 중인 분할매수/매도 계획 요약 + 보유 주수 기반 자동 진행률 계산"""
+    actions = portfolio_data.get("pending_actions", [])
+    if not actions:
+        return "진행 중인 분할 계획 없음"
+
+    # 현재 보유 주수 맵 생성
+    holdings = {}
+    for cat in ["category1", "category2", "category3"]:
+        for it in portfolio_data.get(cat, []):
+            holdings[it["ticker"]] = it["shares"]
+
+    lines = ["[진행 중인 분할 계획]"]
+    for a in actions:
+        if a.get("status") == "완료":
+            continue
+        ticker = a.get("ticker", "")
+        name = a.get("name", ticker)
+        total = a.get("total_units", 0)
+        unit_shares = a.get("unit_shares", 0)
+        start_shares = a.get("start_shares", 0)
+        memo = a.get("memo", "")
+        status = a.get("status", "진행중")
+        created = a.get("created_date", "")
+
+        # 현재 보유 주수 기반 자동 done 계산
+        current_shares = holdings.get(ticker, start_shares)
+        shares_added = current_shares - start_shares
+        if unit_shares > 0:
+            done = min(int(shares_added / unit_shares), total)
+        else:
+            done = a.get("done_units", 0)
+        remaining = total - done
+
+        if status == "일시중단":
+            reason = a.get("pause_reason", "")
+            resume = a.get("resume_condition", "미정")
+            lines.append(
+                f"  ⏸️  {name}({ticker}): {total}회 분할 중 {done}회 완료 "
+                f"— 일시중단({reason}). 재개 조건: {resume}"
+            )
+        elif remaining <= 0:
+            lines.append(f"  ✅ {name}({ticker}): {total}회 분할 완료")
+        else:
+            lines.append(
+                f"  🔄 {name}({ticker}): {total}회 분할 중 {done}회 완료, "
+                f"{remaining}회 남음 [{memo}] (시작: {created})"
+            )
+
+    return "\n".join(lines)
+
+
 # ── 포트폴리오 사전 계산 ─────────────────────────────────────────────────────
 def calc_portfolio_summary(portfolio_data, stock_data, exchange_rate):
     pf = portfolio_data
@@ -2071,6 +2123,55 @@ def run_daily_report():
 
     print(f"\n[DCA] 적립 자동 업데이트", flush=True)
     portfolio_data = update_dca_portfolio(portfolio_data, us_data, exchange_rate)
+
+    # pending_actions 자동 진행률 업데이트
+    try:
+        actions = portfolio_data.get("pending_actions", [])
+        changed = False
+
+        # 현재 보유 주수 맵
+        holdings = {}
+        for cat in ["category1", "category2", "category3"]:
+            for it in portfolio_data.get(cat, []):
+                holdings[it["ticker"]] = it["shares"]
+
+        for a in actions:
+            if a.get("status") == "완료":
+                continue
+            ticker = a.get("ticker")
+            total = a.get("total_units", 0)
+            unit_shares = a.get("unit_shares", 0)
+            start_shares = a.get("start_shares", 0)
+
+            current_shares = holdings.get(ticker, start_shares)
+            shares_added = current_shares - start_shares
+            if unit_shares > 0:
+                done = min(int(shares_added / unit_shares), total)
+            else:
+                done = a.get("done_units", 0)
+
+            # done_units 자동 업데이트
+            if done != a.get("done_units", 0):
+                a["done_units"] = done
+                changed = True
+                print(f"  [PENDING] {a.get('name')} 진행률 자동 업데이트: {done}/{total}회", flush=True)
+
+            # 완료 자동 처리
+            if done >= total and a.get("status") != "완료":
+                a["status"] = "완료"
+                changed = True
+                print(f"  [PENDING] {a.get('name')} 분할 계획 완료 처리", flush=True)
+
+        if changed:
+            with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+                json.dump(portfolio_data, f, ensure_ascii=False, indent=2)
+            import subprocess
+            repo = os.path.dirname(os.path.abspath(PORTFOLIO_FILE))
+            subprocess.run(["git", "-C", repo, "add", "portfolio.json"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", "auto: pending_actions 진행률 자동 업데이트"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "push"], capture_output=True)
+    except Exception as e:
+        print(f"  [PENDING] 처리 실패: {e}", flush=True)
 
     print(f"\n[8/11] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
     kr_data = get_stock_data(KR_TICKERS)
