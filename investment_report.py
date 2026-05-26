@@ -4,10 +4,12 @@ import smtplib
 import schedule
 import time
 import os
+import re
 import json
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from html import unescape
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -22,6 +24,8 @@ ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY",  "")
 GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS",      "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 RECIPIENT_EMAIL    = os.environ.get("RECIPIENT_EMAIL",    "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
 if not ANTHROPIC_API_KEY:
     raise ValueError("ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
@@ -1024,6 +1028,116 @@ def send_email(report_content):
     print(f"  [이메일] 발송 완료 → {RECIPIENT_EMAIL}", flush=True)
 
 
+# ── 텔레그램 발송 헬퍼 ────────────────────────────────────────────────────────
+
+def _html_to_telegram(html: str) -> str:
+    """HTML 보고서를 텔레그램 HTML 서브셋으로 변환."""
+
+    # h2/h3 → bold 헤더
+    html = re.sub(r'<h2[^>]*>(.*?)</h2>', r'\n\n<b>\1</b>\n', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<h3[^>]*>(.*?)</h3>', r'\n<b>\1</b>\n',   html, flags=re.DOTALL | re.IGNORECASE)
+
+    # strong → b
+    html = re.sub(r'<strong[^>]*>(.*?)</strong>', r'<b>\1</b>', html, flags=re.DOTALL | re.IGNORECASE)
+
+    # table → 텍스트 그리드
+    def _table_to_text(m):
+        rows  = re.findall(r'<tr[^>]*>(.*?)</tr>', m.group(0), re.DOTALL | re.IGNORECASE)
+        lines = []
+        for idx, row in enumerate(rows):
+            cells = re.findall(r'<t[hd][^>]*>(.*?)</t[hd]>', row, re.DOTALL | re.IGNORECASE)
+            texts = [unescape(re.sub(r'<[^>]+>', '', c)).strip().replace('\n', ' ')[:25] for c in cells]
+            line  = ' | '.join(t for t in texts if t)
+            if line:
+                lines.append(line)
+                if idx == 0:
+                    lines.append('─' * min(60, len(line)))
+        return '\n' + '\n'.join(lines) + '\n' if lines else ''
+
+    html = re.sub(r'<table[^>]*>.*?</table>', _table_to_text, html, flags=re.DOTALL | re.IGNORECASE)
+
+    # br → \n
+    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+
+    # 블록 요소 → \n
+    html = re.sub(
+        r'</?(?:p|div|ul|ol|li|blockquote|section|article|header|footer|nav)[^>]*>',
+        '\n', html, flags=re.IGNORECASE,
+    )
+
+    # 허용 태그(b/i/u/code/pre)에서 속성 제거
+    for tag in ('b', 'i', 'u', 'code', 'pre'):
+        html = re.sub(rf'<{tag}\s[^>]*>', f'<{tag}>', html, flags=re.IGNORECASE)
+
+    # 허용 태그 외 모든 HTML 태그 제거 (내용은 유지)
+    html = re.sub(r'<(?!/?(?:b|i|u|code|pre)>)[^>]+>', '', html, flags=re.IGNORECASE)
+
+    # HTML 엔티티 디코딩
+    html = unescape(html)
+
+    # 공백 정리
+    html = re.sub(r' {2,}', ' ', html)
+    html = re.sub(r'\n{3,}', '\n\n', html)
+
+    return html.strip()
+
+
+def _split_message(text: str, max_len: int = 4096) -> list:
+    """4096자 초과 시 단락 경계에서 분할."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind('\n\n', 0, max_len)
+        if split_at == -1:
+            split_at = text.rfind('\n', 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip('\n')
+    return [c for c in chunks if c.strip()]
+
+
+def send_telegram(report_content: str):
+    token   = TELEGRAM_BOT_TOKEN
+    chat_id = TELEGRAM_CHAT_ID
+    if not token or not chat_id:
+        print("  [텔레그램] TELEGRAM_BOT_TOKEN 없음, 발송 스킵", flush=True)
+        return
+
+    today  = datetime.now().strftime("%Y년 %m월 %d일")
+    header = f"<b>📈 투자 분석 보고서 — {today}</b>\n"
+    body   = _html_to_telegram(report_content)
+    chunks = _split_message(header + body)
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    print(f"  [텔레그램] {len(chunks)}개 메시지 발송 시작...", flush=True)
+
+    for i, chunk in enumerate(chunks, 1):
+        payload = {"chat_id": chat_id, "text": chunk,
+                   "parse_mode": "HTML", "disable_web_page_preview": True}
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            if resp.status_code == 200:
+                print(f"  [텔레그램] {i}/{len(chunks)} 완료", flush=True)
+            else:
+                # HTML 파싱 오류 시 순수 텍스트로 재시도
+                plain = re.sub(r'<[^>]+>', '', chunk)
+                resp2 = requests.post(url, json={"chat_id": chat_id, "text": plain}, timeout=30)
+                status = "완료(텍스트)" if resp2.status_code == 200 else f"실패({resp2.status_code})"
+                print(f"  [텔레그램] {i}/{len(chunks)} {status}", flush=True)
+        except Exception as e:
+            print(f"  [텔레그램] {i}/{len(chunks)} 오류: {e}", flush=True)
+
+        if i < len(chunks):
+            time.sleep(0.5)
+
+    print(f"  [텔레그램] 발송 완료 → chat_id={chat_id}", flush=True)
+
+
 # ── 메인 실행 ─────────────────────────────────────────────────────────────────
 def run_daily_report():
     print(f"\n{'='*50}", flush=True)
@@ -1068,6 +1182,9 @@ def run_daily_report():
 
     print(f"\n[9/9] 이메일 발송", flush=True)
     send_email(report)
+
+    print(f"\n[9/9] 텔레그램 발송", flush=True)
+    send_telegram(report)
 
     print(f"\n{'='*50}", flush=True)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 전체 완료", flush=True)
