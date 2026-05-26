@@ -41,12 +41,15 @@ def save_portfolio(pf: dict):
 def get_us_price(ticker: str):
     try:
         stock = yf.Ticker(ticker)
+        # 오늘 5분봉 데이터
         hist = stock.history(period="1d", interval="5m")
         if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-        return float(stock.fast_info.last_price)
+            current = float(hist["Close"].iloc[-1])
+            open_price = float(hist["Open"].iloc[0])  # 시가
+            return current, open_price
     except:
-        return None
+        pass
+    return None, None
 
 
 def get_kr_price(code: str):
@@ -55,11 +58,24 @@ def get_kr_price(code: str):
         url = f"https://finance.naver.com/item/main.nhn?code={code}"
         r = requests.get(url, headers={**HEADERS, "Referer": "https://finance.naver.com"}, timeout=8)
         soup = BeautifulSoup(r.text, "html.parser")
+        # 현재가
         tag = soup.find("strong", id="_nowVal")
-        if tag:
-            return float(tag.get_text(strip=True).replace(",", ""))
+        current = float(tag.get_text(strip=True).replace(",", "")) if tag else None
+        # 시가
+        open_price = None
+        table = soup.find("table", class_="no_info")
+        if table:
+            tds = table.find_all("td")
+            for i, td in enumerate(tds):
+                if "시가" in td.get_text():
+                    try:
+                        open_price = float(tds[i+1].get_text(strip=True).replace(",", ""))
+                    except:
+                        pass
+        return current, open_price
     except:
-        return None
+        pass
+    return None, None
 
 
 def get_rsi(ticker: str, period: int = 14):
@@ -270,16 +286,18 @@ def check_alerts():
         if currency == "KRW":
             if not is_kr_market:
                 continue
-            price = get_kr_price(ticker.split(".")[0])
+            price, open_price = get_kr_price(ticker.split(".")[0])
         else:
             if not is_us_market:
                 continue
-            price = get_us_price(ticker)
+            price, open_price = get_us_price(ticker)
 
         if not price:
             continue
 
-        pct = (price / avg - 1) * 100
+        # 급등락 감지는 시가 대비 현재가
+        pct_from_avg = (price / avg - 1) * 100
+        pct = (price / open_price - 1) * 100 if open_price else pct_from_avg
 
         # 목표가 도달 알림 (적립식 제외)
         if not is_dca and target and price >= float(target):
@@ -307,8 +325,8 @@ def check_alerts():
                 f"{claude_analysis}"
             )
 
-        # 급등락 감지 (±5% 이상) — 모든 종목
-        elif abs(pct) >= 5:
+        # 급등락 감지 (±3% 이상, 시가 대비) — 모든 종목
+        elif abs(pct) >= 3:
             direction = "급등" if pct > 0 else "급락"
             claude_analysis = analyze_with_claude(
                 ticker, name, price, avg, pct, direction,
@@ -319,7 +337,7 @@ def check_alerts():
                 emoji = "📈" if pct > 0 else "💰"
                 base_msg = (
                     f"{emoji} <b>{name}({ticker}) {direction} 감지 ({pct:+.1f}%)</b>\n"
-                    f"현재가: {price:,.2f} (평단 대비 {pct:+.1f}%)\n\n"
+                    f"현재가: {price:,.2f} (시가 대비 {pct:+.1f}% / 평단 대비 {pct_from_avg:+.1f}%)\n\n"
                     f"{claude_analysis}"
                 )
             else:
@@ -346,7 +364,7 @@ def check_alerts():
                     if rsi <= 30 and stop_loss:
                         new_stop = round(float(stop_loss) * 0.97, 2)
                         change_reason.append(f"RSI {rsi:.1f} 과매도")
-                    if pct >= 5 and target:
+                    if pct >= 3 and target:
                         new_target = round(float(target) * 1.05, 2)
                         change_reason.append(f"급등 {pct:+.1f}%")
 
