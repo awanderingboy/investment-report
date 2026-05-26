@@ -182,6 +182,15 @@ def get_macro_data():
         "Gold": "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=5d",
     }
     results = {}
+    def _fetch_yahoo_json(url):
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            closes = resp.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if closes:
+                return closes
+        return []
+
     for name, ticker in macro_tickers.items():
         current = None
         close_series = []
@@ -199,17 +208,24 @@ def get_macro_data():
         except Exception as e:
             print(f"  [{name}] yfinance 실패: {e}", flush=True)
 
-        # 2순위: Yahoo Finance JSON API (WTI/Gold 전용)
+        # 범위 검증 (yfinance 값) — 이탈 시 폴백 준비
+        _range_failed = False
+        if current is not None and name in _range_bounds:
+            lo, hi = _range_bounds[name]
+            if not (lo <= current <= hi):
+                print(f"  ⚠️ [{name}] yfinance 범위 이탈 ({round(current, 2)}) — Yahoo JSON 폴백 시도", flush=True)
+                current = None
+                close_series = []
+                _range_failed = True
+
+        # 2순위: Yahoo Finance JSON API (WTI/Gold — 수집 실패 또는 범위 이탈 시)
         if current is None and name in _fallback_urls:
             try:
-                resp = requests.get(_fallback_urls[name], headers=HEADERS, timeout=10)
-                if resp.status_code == 200:
-                    closes = resp.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-                    closes = [c for c in closes if c is not None]
-                    if closes:
-                        current = float(closes[-1])
-                        close_series = closes
-                        print(f"  [{name}] Yahoo JSON API 폴백 사용", flush=True)
+                closes = _fetch_yahoo_json(_fallback_urls[name])
+                if closes:
+                    current = float(closes[-1])
+                    close_series = closes
+                    print(f"  [{name}] Yahoo JSON API 폴백 사용", flush=True)
             except Exception as e:
                 print(f"  [{name}] Yahoo JSON API 폴백 실패: {e}", flush=True)
 
@@ -218,7 +234,7 @@ def get_macro_data():
             results[name] = None
             continue
 
-        # 범위 검증
+        # 범위 검증 (최종)
         if name in _range_bounds:
             lo, hi = _range_bounds[name]
             if not (lo <= current <= hi):
@@ -239,23 +255,51 @@ def get_news_data(tickers: list) -> dict:
     results = {}
     us_tickers = [t for t in tickers if not (t.endswith(".KS") or t.endswith(".KQ"))]
     for ticker in us_tickers:
+        news = []
+
+        # 1순위: Yahoo RSS (region)
         try:
             url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
             resp = requests.get(url, headers=HEADERS, timeout=8)
             if resp.status_code == 200:
                 root = ET.fromstring(resp.content)
-                items = root.findall(".//item")[:3]
-                news = []
-                for item in items:
+                for item in root.findall(".//item")[:3]:
                     title = item.findtext("title", "").strip()
                     pubdate = item.findtext("pubDate", "").strip()
                     if title:
                         news.append(f"[{pubdate[:16]}] {title}")
-                if news:
-                    results[ticker] = news
-                    print(f"    [{ticker}] 뉴스 {len(news)}건", flush=True)
-        except Exception as e:
-            print(f"    [{ticker}] 뉴스 수집 실패: {e}", flush=True)
+        except Exception:
+            pass
+
+        # 2순위: Yahoo RSS (alternative)
+        if not news:
+            try:
+                url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
+                resp = requests.get(url, headers=HEADERS, timeout=8)
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.content)
+                    for item in root.findall(".//item")[:3]:
+                        title = item.findtext("title", "").strip()
+                        pubdate = item.findtext("pubDate", "").strip()
+                        if title:
+                            news.append(f"[{pubdate[:16]}] {title}")
+            except Exception:
+                pass
+
+        # 3순위: 뉴스 수집 포기 — 안내 메시지
+        if not news:
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
+                resp = requests.get(url, headers=HEADERS, timeout=8)
+                if resp.status_code == 200:
+                    news = [f"최신 뉴스 수집 실패 — 직접 확인 권고"]
+            except Exception:
+                news = [f"최신 뉴스 수집 실패 — 직접 확인 권고"]
+
+        if news:
+            results[ticker] = news
+            label = f"{len(news)}건" if news[0] != "최신 뉴스 수집 실패 — 직접 확인 권고" else "수집 실패"
+            print(f"    [{ticker}] 뉴스 {label}", flush=True)
 
     kr_tickers = [t for t in tickers if t.endswith(".KS") or t.endswith(".KQ")]
     for ticker in kr_tickers:
@@ -1653,9 +1697,11 @@ user_content에 [백테스팅 결과]가 제공된다.
 - 포트폴리오 전체 VOO 초과 성과 비율을 보고서 서두에 한 줄 명시하라
 
 [판단 일관성 자가검증 추가 항목]
-⑤ 종합 추천 TOP 3의 판단 등급과 스코어카드의 판단 등급이 일치하는가?
-   → TOP 3에 💎강력매수로 표시했으면 스코어카드도 반드시 💎강력매수여야 한다.
-   → 불일치 시 둘 중 더 보수적인 등급으로 통일하라.
+⑤ 종합 추천 TOP 3의 판단 등급과 스코어카드의 판단 등급이 반드시 일치해야 한다.
+   TOP 3에 💎강력매수로 표시했으면 스코어카드도 반드시 💎강력매수여야 한다.
+   TOP 3에 🟢추가매수로 표시했으면 스코어카드도 반드시 🟢추가매수여야 한다.
+   불일치 발견 시 스코어카드를 TOP 3 등급에 맞춰 수정하라.
+   보고서 출력 전 반드시 이 검증을 수행하라.
 """
 
     static_system = (
