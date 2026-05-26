@@ -145,11 +145,49 @@
       "total_units": 20,
       "done_units": 0,
       "unit_shares": 1,
-      "start_shares": 85,
+      "start_shares": 50,
       "unit_amount_usd": 24.5,
       "memo": "카테고리3 $24~25 분할",
       "created_date": "2026-05-27",
       "status": "진행중"
+    }
+  ],
+  "executed_actions": [
+    {
+      "date": "2026-05-27",
+      "action": "매수",
+      "ticker": "NVDA",
+      "name": "엔비디아",
+      "shares": 2,
+      "price_krw": 323891,
+      "memo": "보고서 추가매수 권고 실행 (정배열+영업이익률 65.6%+매출성장 85%)"
+    },
+    {
+      "date": "2026-05-27",
+      "action": "매수",
+      "ticker": "GOOGL",
+      "name": "알파벳A",
+      "shares": 2,
+      "price_krw": 587311,
+      "memo": "보고서 적립 외 신규 추가매수 권고 실행 (AI 모멘텀+PER 29 저평가)"
+    },
+    {
+      "date": "2026-05-27",
+      "action": "매수",
+      "ticker": "RGTI",
+      "name": "리게티컴퓨팅",
+      "shares": 35,
+      "price_krw": 37484,
+      "memo": "보고서 카테고리3 추가매수 권고 실행 (거래량 2.13배+MACD 골든크로스)"
+    },
+    {
+      "date": "2026-05-27",
+      "action": "매도",
+      "ticker": "PLTR",
+      "name": "팔란티어",
+      "shares": 5,
+      "price_krw": 205400,
+      "memo": "보고서 비중축소 권고 실행 (내부자 매도 의심+PER 153 고평가)"
     }
   ]
 }

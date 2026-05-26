@@ -1323,6 +1323,29 @@ def generate_report(us_data, kr_data, exchange_rate,
     all_stock_data = {**us_data, **kr_data}
     portfolio_calc = calc_portfolio_summary(pf, all_stock_data, exchange_rate)
     yesterdays_verification = build_yesterdays_verification(all_stock_data, exchange_rate)
+
+    # 전일 실행 내역 요약
+    executed = pf.get("executed_actions", [])
+    from datetime import datetime as _dt, timedelta as _td
+    yesterday = (_dt.now() - _td(days=1)).strftime("%Y-%m-%d")
+    today_str = _dt.now().strftime("%Y-%m-%d")
+    recent_executed = [
+        a for a in executed
+        if a.get("date") in [yesterday, today_str]
+    ]
+    if recent_executed:
+        exec_lines = ["[전일/오늘 실행된 매매 내역 — 보고서 판단에 반영하라]"]
+        for a in recent_executed:
+            action = a.get("action", "")
+            name = a.get("name", "")
+            ticker = a.get("ticker", "")
+            shares = a.get("shares", 0)
+            memo = a.get("memo", "")
+            exec_lines.append(f"  {action} 완료: {name}({ticker}) {shares}주 — {memo}")
+        executed_summary = "\n".join(exec_lines)
+    else:
+        executed_summary = "전일 실행 내역 없음"
+
     backtest_result = run_backtest(pf, all_stock_data, exchange_rate)
 
     static_system = """너는 500만원에서 시작해 자산 10억 이상을 달성한 전문 퀀트 트레이더이자 포트폴리오 매니저다.
@@ -1879,6 +1902,13 @@ user_content에 [백테스팅 결과]가 제공된다.
 - 손절 트리거: "손절 트리거: $XXX" 또는 "손절 트리거: XXX,XXX원"
 이 형식이 없으면 자동 저장 시스템이 작동하지 않는다.
 카테고리1 적립 종목도 반드시 단기 목표가와 손절 트리거를 명시하라.
+
+[실행 완료된 매매 내역 활용 원칙]
+user_content에 [실행 완료된 매매 내역]이 제공된다.
+- 매수 완료된 종목은 "매수 완료" 로 표시하고 추가 매수 권고를 중복으로 내지 마라
+- 매도 완료된 종목은 "매도 완료" 로 표시하고 추가 매도 권고를 중복으로 내지 마라
+- 분할 계획이 있는 종목은 [진행 중인 분할 계획] 섹션과 연계해서 남은 횟수만 안내하라
+- 실행 내역이 있으면 액션플랜 첫 줄에 "✅ 전일 실행 완료: XXX" 로 먼저 표시하라
 """
 
     static_system = (
@@ -1893,6 +1923,7 @@ user_content에 [백테스팅 결과]가 제공된다.
         f"[종목별 최신 뉴스]\n{_fmt_news(news_data)}\n\n"
         f"[종목별 실적 데이터]\n{_fmt_earnings(earnings_data)}\n\n"
         f"[전일 추천 검증 데이터 — 자기학습용]\n{yesterdays_verification}\n\n"
+        f"[실행 완료된 매매 내역]\n{executed_summary}\n\n"
         f"오늘 날짜: {today}\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
         f"실시간 환율: {exchange_rate}원/달러\n\n"
