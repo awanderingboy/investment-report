@@ -78,6 +78,84 @@ SEC_HEADERS = {"User-Agent": "investment-report-bot/1.0 xogus5512@gmail.com"}
 
 
 # ── 포트폴리오 로드 ──────────────────────────────────────────────────────────
+DAILY_DCA = {
+    "GOOGL": {"daily_usd": 25, "currency": "USD"},
+    "FCX":   {"daily_usd": 10, "currency": "USD"},
+    "VOO":   {"daily_usd": 20, "currency": "USD"},
+}
+
+
+def update_dca_portfolio(portfolio_data: dict, us_data: dict, exchange_rate: float) -> dict:
+    """매일 적립 매수 금액 기준으로 portfolio.json 수량 자동 업데이트"""
+    import datetime
+
+    today = datetime.date.today()
+
+    # 주말 또는 미국 공휴일이면 스킵
+    if today.weekday() >= 5:  # 0=월 ~ 4=금, 5=토, 6=일
+        print(f"  [DCA] 주말({today}) — 적립 스킵", flush=True)
+        return portfolio_data
+
+    # 이미 오늘 적립했는지 확인
+    last_dca = portfolio_data.get("last_dca_date", "")
+    if last_dca == str(today):
+        print(f"  [DCA] 오늘({today}) 이미 적립 완료 — 스킵", flush=True)
+        return portfolio_data
+
+    pf = portfolio_data.copy()
+    updated = []
+
+    for it in pf.get("category1", []):
+        ticker = it["ticker"]
+        if ticker not in DAILY_DCA:
+            continue
+
+        dca = DAILY_DCA[ticker]
+        daily_usd = dca["daily_usd"]
+
+        # 현재가 가져오기
+        price = us_data.get(ticker, {}).get("현재가")
+        if not price or price <= 0:
+            print(f"  [DCA] {ticker} 현재가 없음 — 적립 스킵", flush=True)
+            continue
+
+        # 매수 수량 계산 (소수점 6자리)
+        shares_bought = round(daily_usd / price, 6)
+        old_shares = it["shares"]
+        old_avg = it["avg_price"]
+
+        # 평단 재계산
+        new_shares = round(old_shares + shares_bought, 6)
+        new_avg = round((old_shares * old_avg + shares_bought * price) / new_shares, 4)
+
+        it["shares"] = new_shares
+        it["avg_price"] = new_avg
+
+        # 달러 현금 차감
+        pf["cash"]["usd"] = round(pf["cash"].get("usd", 0) - daily_usd, 2)
+
+        updated.append(f"{ticker}: +{shares_bought}주 @ ${price} (${daily_usd})")
+        print(f"  [DCA] {ticker}: +{shares_bought}주 @ ${price:.2f} (${daily_usd}/일)", flush=True)
+
+    if updated:
+        pf["last_dca_date"] = str(today)
+        # portfolio.json 저장
+        try:
+            with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+                json.dump(pf, f, ensure_ascii=False, indent=2)
+            # git push
+            import subprocess
+            repo = os.path.dirname(os.path.abspath(PORTFOLIO_FILE))
+            subprocess.run(["git", "-C", repo, "add", "portfolio.json"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", f"auto: DCA 적립 {today} ({', '.join(updated)})"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "push"], capture_output=True)
+            print(f"  [DCA] portfolio.json 저장 및 git push 완료", flush=True)
+        except Exception as e:
+            print(f"  [DCA] 저장 실패: {e}", flush=True)
+
+    return pf
+
+
 def load_portfolio() -> dict:
     try:
         with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
@@ -1990,6 +2068,9 @@ def run_daily_report():
     print(f"\n[7/11] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
     us_data = get_stock_data(US_TICKERS)
     print(f"  → 수집 완료: {list(us_data.keys())}", flush=True)
+
+    print(f"\n[DCA] 적립 자동 업데이트", flush=True)
+    portfolio_data = update_dca_portfolio(portfolio_data, us_data, exchange_rate)
 
     print(f"\n[8/11] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
     kr_data = get_stock_data(KR_TICKERS)
