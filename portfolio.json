@@ -11,7 +11,8 @@
       "shares": 4.834287,
       "avg_price": 351.9675,
       "currency": "USD",
-      "daily_buy": 25
+      "daily_buy": 25,
+      "dca_alert": true
     },
     {
       "ticker": "FCX",
@@ -19,7 +20,8 @@
       "shares": 12.995376,
       "avg_price": 61.5638,
       "currency": "USD",
-      "daily_buy": 10
+      "daily_buy": 10,
+      "dca_alert": true
     },
     {
       "ticker": "VOO",
@@ -27,7 +29,8 @@
       "shares": 3.418985,
       "avg_price": 622.2593,
       "currency": "USD",
-      "daily_buy": 20
+      "daily_buy": 20,
+      "dca_alert": true
     }
   ],
   "category2": [
@@ -36,49 +39,63 @@
       "name": "셀트리온제약",
       "shares": 398,
       "avg_price": 68287,
-      "currency": "KRW"
+      "currency": "KRW",
+      "target_price": null,
+      "stop_loss": 45000
     },
     {
       "ticker": "035720.KS",
       "name": "카카오",
       "shares": 104,
       "avg_price": 36151,
-      "currency": "KRW"
+      "currency": "KRW",
+      "target_price": 45000,
+      "stop_loss": 38000
     },
     {
       "ticker": "035420.KS",
       "name": "네이버",
       "shares": 50,
       "avg_price": 214000,
-      "currency": "KRW"
+      "currency": "KRW",
+      "target_price": 225000,
+      "stop_loss": 195000
     },
     {
       "ticker": "BEAM",
       "name": "빔테라퓨틱스",
       "shares": 100,
       "avg_price": 32.49,
-      "currency": "USD"
+      "currency": "USD",
+      "target_price": 35,
+      "stop_loss": 27
     },
     {
       "ticker": "NVDA",
       "name": "엔비디아",
       "shares": 12,
       "avg_price": 184.84,
-      "currency": "USD"
+      "currency": "USD",
+      "target_price": 235,
+      "stop_loss": 195
     },
     {
       "ticker": "PLTR",
       "name": "팔란티어",
       "shares": 6.64,
       "avg_price": 142.36,
-      "currency": "USD"
+      "currency": "USD",
+      "target_price": 150,
+      "stop_loss": 130
     },
     {
       "ticker": "PWFL",
       "name": "파워플리트",
       "shares": 1200,
       "avg_price": 3.68,
-      "currency": "USD"
+      "currency": "USD",
+      "target_price": null,
+      "stop_loss": null
     }
   ],
   "category3": [
@@ -87,14 +104,18 @@
       "name": "한미반도체",
       "shares": 2,
       "avg_price": 323000,
-      "currency": "KRW"
+      "currency": "KRW",
+      "target_price": 400000,
+      "stop_loss": 290000
     },
     {
       "ticker": "RGTI",
       "name": "리게티컴퓨팅",
       "shares": 85,
       "avg_price": 25.75,
-      "currency": "USD"
+      "currency": "USD",
+      "target_price": 32,
+      "stop_loss": 20
     }
   ],
   "category3_cash": "auto",
