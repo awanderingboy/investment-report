@@ -707,6 +707,111 @@ def get_stock_data(tickers):
     return results
 
 
+# ── 포트폴리오 사전 계산 ─────────────────────────────────────────────────────
+def calc_portfolio_summary(portfolio_data, stock_data, exchange_rate):
+    pf = portfolio_data
+    er = exchange_rate
+    lines = []
+
+    def get_price(ticker):
+        d = stock_data.get(ticker, {})
+        p = d.get("현재가")
+        if p and float(p) > 0:
+            return float(p)
+        return None
+
+    total = 0
+
+    lines.append("\n[카테고리1 계산]")
+    cat1_sum = 0
+    for it in pf.get("category1", []):
+        price = get_price(it["ticker"])
+        shares = it["shares"]
+        avg = it["avg_price"]
+        if price:
+            value = price * shares * er if it["currency"] == "USD" else price * shares
+            cost  = avg   * shares * er if it["currency"] == "USD" else avg   * shares
+            pct   = (price / avg - 1) * 100
+            lines.append(f"  {it['name']}({it['ticker']}): {price} × {shares}주 = {value:,.0f}원 (수익률 {pct:+.1f}%, 손익 {value-cost:+,.0f}원)")
+            cat1_sum += value
+        else:
+            lines.append(f"  {it['name']}({it['ticker']}): 현재가 미수집 → 0원")
+    lines.append(f"  카테고리1 소계: {cat1_sum:,.0f}원")
+    total += cat1_sum
+
+    lines.append("\n[카테고리2-한국 계산]")
+    cat2_kr_sum = 0
+    for it in pf.get("category2", []):
+        if it["currency"] != "KRW":
+            continue
+        price = get_price(it["ticker"])
+        shares = it["shares"]
+        avg = it["avg_price"]
+        if price:
+            value = price * shares
+            cost  = avg   * shares
+            pct   = (price / avg - 1) * 100
+            lines.append(f"  {it['name']}: {price:,.0f} × {shares}주 = {value:,.0f}원 (수익률 {pct:+.1f}%, 손익 {value-cost:+,.0f}원)")
+            cat2_kr_sum += value
+        else:
+            lines.append(f"  {it['name']}: 현재가 미수집 → 0원")
+    lines.append(f"  카테고리2-한국 소계: {cat2_kr_sum:,.0f}원")
+    total += cat2_kr_sum
+
+    lines.append("\n[카테고리2-미국 계산]")
+    cat2_us_sum = 0
+    for it in pf.get("category2", []):
+        if it["currency"] != "USD":
+            continue
+        price = get_price(it["ticker"])
+        shares = it["shares"]
+        avg = it["avg_price"]
+        if price:
+            value = price * shares * er
+            cost  = avg   * shares * er
+            pct   = (price / avg - 1) * 100
+            lines.append(f"  {it['name']}({it['ticker']}): ${price} × {shares}주 × {er:.0f} = {value:,.0f}원 (수익률 {pct:+.1f}%, 손익 {value-cost:+,.0f}원)")
+            cat2_us_sum += value
+        else:
+            lines.append(f"  {it['name']}({it['ticker']}): 현재가 미수집 → 0원 (시가 미수집)")
+    lines.append(f"  카테고리2-미국 소계: {cat2_us_sum:,.0f}원")
+    total += cat2_us_sum
+
+    lines.append("\n[현금]")
+    cash = pf.get("cash", {})
+    krw_cash = cash.get("krw", 0)
+    usd_cash = cash.get("usd", 0)
+    usd_cash_krw = usd_cash * er
+    cash_total = krw_cash + usd_cash_krw
+    lines.append(f"  원화: {krw_cash:,.0f}원")
+    lines.append(f"  달러: ${usd_cash:,.2f} × {er:.0f} = {usd_cash_krw:,.0f}원")
+    lines.append(f"  현금 소계: {cash_total:,.0f}원")
+    total += cash_total
+
+    lines.append("\n[카테고리3]")
+    cat3_sum = 0
+    cat3_cash = pf.get("category3_cash", 0)
+    for it in pf.get("category3", []):
+        price = get_price(it["ticker"])
+        shares = it["shares"]
+        avg = it["avg_price"]
+        if price:
+            value = price * shares * er if it["currency"] == "USD" else price * shares
+            cost  = avg   * shares * er if it["currency"] == "USD" else avg   * shares
+            pct   = (price / avg - 1) * 100
+            lines.append(f"  {it['name']}({it['ticker']}): {value:,.0f}원 (수익률 {pct:+.1f}%, 손익 {value-cost:+,.0f}원)")
+            cat3_sum += value
+        else:
+            lines.append(f"  {it['name']}({it['ticker']}): 현재가 미수집 → 0원")
+    lines.append(f"  카테고리3 현금: {cat3_cash:,.0f}원")
+    cat3_total = cat3_sum + cat3_cash
+    lines.append(f"  카테고리3 소계: {cat3_total:,.0f}원")
+    total += cat3_total
+
+    lines.append(f"\n★ 총합계: {total:,.0f}원 (적용 환율: {er:.1f}원/달러)")
+    return "\n".join(lines)
+
+
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
@@ -718,6 +823,9 @@ def generate_report(us_data, kr_data, exchange_rate,
     pf           = portfolio_data if portfolio_data is not None else _HARDCODED_PORTFOLIO
     _pf_section  = _portfolio_section_str(pf)
     _restricted  = _restricted_tickers_list(pf)
+
+    all_stock_data = {**us_data, **kr_data}
+    portfolio_calc = calc_portfolio_summary(pf, all_stock_data, exchange_rate)
 
     static_system = """너는 500만원에서 시작해 자산 10억 이상을 달성한 전문 퀀트 트레이더이자 포트폴리오 매니저다.
 목표는 단 하나 — 사용자가 최대한 많은 돈을 버는 것.
@@ -1194,7 +1302,39 @@ PWFL(파워플리트) 판단 원칙:
 □ PLTR Form 4 방향 — SEC EDGAR에서 직접 확인
 □ 카테고리3 진입 전 — 해당 금액 전액 손실 시 생활에 지장 없는지 확인
 □ 데이터 이상 ⚠️ 항목 — 직접 확인 후 판단
-보고서는 방향을 제시하지만 최종 판단은 본인이 한다."""
+보고서는 방향을 제시하지만 최종 판단은 본인이 한다.
+
+[포트폴리오 계산 절대 원칙]
+user_content에 "[포트폴리오 사전 계산값]" 섹션이 제공된다.
+- 총자산, 평가손익, 수익률은 이 사전 계산값을 그대로 사용하라. 절대 직접 계산하지 마라.
+- 사전 계산값과 다른 수치를 보고서에 쓰는 것을 금지한다.
+- "현재가 미수집 → 0원"으로 표시된 종목은 계산에서 제외하고 "(시가 미수집)" 명시.
+
+[카테고리3 신규 진입 종목 검증]
+이번 달 실행 전략의 "신규 진입 종목" 선정 전 반드시 확인:
+- category3에 이미 보유 중인 종목은 "신규 진입"이 아닌 "추가매수" 또는 "홀딩"으로만 표시.
+- 신규 진입은 category1, category2, category3 어디에도 없는 종목이어야 한다.
+
+[액션플랜 자금 검증]
+액션플랜 작성 전 자금 흐름을 반드시 계산하라:
+- 총 회수금액 = 매도 종목들의 매도금액 합산
+- 총 투입금액 = 매수 종목들의 매수금액 합산
+- 총 회수금액 >= 총 투입금액 이어야 한다. 부족하면 매수 수량을 줄여라.
+- 액션플랜 마지막에 한 줄 요약 필수:
+  예: "총 회수 935만원 → 총 투입 890만원 → 잔여 현금 +45만원"
+
+[WTI/Gold 수집 실패 원인 구분]
+데이터가 None인 경우 아래 둘 중 하나로 구분해서 표시:
+- "⚠️ WTI 범위 이탈(X달러) — 이상 데이터 제거, 수동 확인 필요"
+- "⚠️ WTI API 수집 오류 — 수동 확인 필요"
+단순히 "수집 실패"로만 표시하지 마라.
+
+[카테고리1 적립 종목 판단 구분]
+GOOGL/FCX/VOO에 대한 🟢추가매수 판단 시 반드시 구분:
+- "적립 지속 (신규 자금 투입 없음)"
+- "적립 외 신규 자금 X원 추가 투입 권고"
+신규 자금 추가 투입 권고는 매우 확실한 근거가 있을 때만 허용.
+카테고리1은 원칙상 단기 매도 금지이며 적립 지속이 기본이다."""
 
     static_system = (
         static_system
@@ -1203,6 +1343,7 @@ PWFL(파워플리트) 판단 원칙:
     )
 
     user_content = (
+        f"[포트폴리오 사전 계산값 — 이 수치를 그대로 사용하라. 직접 계산 금지]\n{portfolio_calc}\n\n"
         f"오늘 날짜: {today}\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
         f"실시간 환율: {exchange_rate}원/달러\n\n"
