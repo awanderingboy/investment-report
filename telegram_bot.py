@@ -52,6 +52,15 @@ def _save(pf: dict):
     pf["last_updated"] = date.today().isoformat()
     with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
         json.dump(pf, f, ensure_ascii=False, indent=2)
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(PORTFOLIO_FILE))
+    subprocess.run(["git", "-C", repo, "add", "portfolio.json"], capture_output=True)
+    result = subprocess.run(
+        ["git", "-C", repo, "commit", "-m", f"auto: portfolio update {pf.get('last_updated', '')}"],
+        capture_output=True, text=True
+    )
+    if "nothing to commit" not in result.stdout:
+        subprocess.run(["git", "-C", repo, "push"], capture_output=True)
 
 
 # ── 종목 검색 ──────────────────────────────────────────────────────────────────
