@@ -97,6 +97,7 @@
       "currency": "USD"
     }
   ],
-  "category3_cash": 2366464,
-  "last_updated": "2026-05-26"
+  "category3_cash": "auto",
+  "last_updated": "2026-05-26",
+  "category3_seed": 5000000
 }

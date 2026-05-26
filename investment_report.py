@@ -65,7 +65,8 @@ _HARDCODED_PORTFOLIO = {
         {"ticker": "PWFL",      "name": "파워플리트",   "shares": 1200,  "avg_price": 3.68,   "currency": "USD"},
     ],
     "category3": [],
-    "category3_cash": 5000000,
+    "category3_seed": 5000000,
+    "category3_cash": "auto",
 }
 
 HEADERS = {
@@ -105,7 +106,18 @@ def _portfolio_section_str(pf: dict) -> str:
         avg = f"${it['avg_price']:.2f}" if it["currency"] == "USD" else f"{it['avg_price']:,.0f}원"
         lines.append(f"- {it['name']}({it['ticker']}): 평단 {avg} / {it['shares']}주")
 
-    cat3_cash     = pf.get("category3_cash", 5000000)
+    _cat3_cash_raw = pf.get("category3_cash", 5000000)
+    cat3_seed = pf.get("category3_seed", 5000000)
+    if _cat3_cash_raw == "auto":
+        _invested = sum(
+            it["shares"] * it["avg_price"] * 1400
+            if it["currency"] == "USD"
+            else it["shares"] * it["avg_price"]
+            for it in pf.get("category3", [])
+        )
+        cat3_cash = int(cat3_seed - _invested)
+    else:
+        cat3_cash = int(_cat3_cash_raw)
     cat3_holdings = pf.get("category3", [])
     lines.append("\n카테고리 3 - 500만원 프로젝트 (다른 포트폴리오와 완전 분리):")
     lines.append(f"- 시드 현금: {cat3_cash:,}원")
@@ -1048,7 +1060,18 @@ def calc_portfolio_summary(portfolio_data, stock_data, exchange_rate):
 
     lines.append("\n[카테고리3]")
     cat3_sum = 0
-    cat3_cash = pf.get("category3_cash", 0)
+    _cat3_cash_raw = pf.get("category3_cash", 0)
+    cat3_seed = pf.get("category3_seed", 5000000)
+    if _cat3_cash_raw == "auto":
+        _invested = sum(
+            it["shares"] * it["avg_price"] * er
+            if it["currency"] == "USD"
+            else it["shares"] * it["avg_price"]
+            for it in pf.get("category3", [])
+        )
+        cat3_cash = cat3_seed - _invested
+    else:
+        cat3_cash = float(_cat3_cash_raw)
     for it in pf.get("category3", []):
         price = get_price(it["ticker"])
         shares = it["shares"]
