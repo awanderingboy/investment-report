@@ -252,8 +252,8 @@ def get_macro_data():
     _range_bounds = {
         "VIX":  (10,   80),
         "DXY":  (85,  115),
-        "WTI":  (50,   90),
-        "Gold": (1800, 4000),
+        "WTI":  (50,   120),
+        "Gold": (1800, 5500),
     }
     _fallback_urls = {
         "WTI":  "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=1d&range=5d",
