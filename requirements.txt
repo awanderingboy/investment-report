@@ -4,3 +4,4 @@ schedule
 requests
 beautifulsoup4
 python-telegram-bot
+python-dotenv

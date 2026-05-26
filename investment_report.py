@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import anthropic
 import yfinance as yf
 import smtplib
