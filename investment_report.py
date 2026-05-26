@@ -545,6 +545,28 @@ def _calc_volume_ratio(volume):
 def _get_current_price(stock, info, hist, ticker):
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
 
+    # 한국 주식: history 최근값 우선 (fast_info가 stale한 경우가 많음)
+    if is_kr:
+        if not hist.empty:
+            price = hist["Close"].dropna().iloc[-1]
+            if price and price > 0:
+                print(f"    [{ticker}] 현재가 출처: history[-1]", flush=True)
+                return price
+        try:
+            price = stock.fast_info.last_price
+            if price and price > 0:
+                print(f"    [{ticker}] 현재가 출처: fast_info (KR 폴백)", flush=True)
+                return price
+        except Exception:
+            pass
+        for key in ("regularMarketPrice", "regularMarketPreviousClose"):
+            price = info.get(key)
+            if price and price > 0:
+                print(f"    [{ticker}] 현재가 출처: info[{key}] (KR 폴백)", flush=True)
+                return price
+        return None
+
+    # 미국 주식: fast_info 우선 (실시간에 가까움)
     try:
         price = stock.fast_info.last_price
         if price and price > 0:
@@ -557,12 +579,6 @@ def _get_current_price(stock, info, hist, ticker):
         price = info.get(key)
         if price and price > 0:
             print(f"    [{ticker}] 현재가 출처: info[{key}]", flush=True)
-            return price
-
-    if is_kr:
-        price = info.get("regularMarketPreviousClose")
-        if price and price > 0:
-            print(f"    [{ticker}] 현재가 출처: regularMarketPreviousClose (KR 폴백)", flush=True)
             return price
 
     if not hist.empty:
