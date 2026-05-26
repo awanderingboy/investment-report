@@ -707,6 +707,90 @@ def get_stock_data(tickers):
     return results
 
 
+# ── 자기학습 로그 ─────────────────────────────────────────────────────────────
+LEARNING_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learning_log.json")
+
+def load_learning_log():
+    try:
+        with open(LEARNING_LOG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_learning_log(log_entry: dict):
+    log = load_learning_log()
+    today = datetime.now().strftime("%Y-%m-%d")
+    log[today] = log_entry
+    cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+    log = {k: v for k, v in log.items() if k >= cutoff}
+    with open(LEARNING_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+    print(f"  learning_log.json 저장 완료 ({len(log)}일치)", flush=True)
+
+def build_yesterdays_verification(all_stock_data: dict, exchange_rate: float) -> str:
+    log = load_learning_log()
+    if not log:
+        return "전일 보고서 없음 — 자기학습 생략"
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    dates = sorted(log.keys())
+    recent_date = dates[-1] if dates[-1] != today_str else (dates[-2] if len(dates) >= 2 else None)
+
+    if not recent_date:
+        return "전일 보고서 없음 — 자기학습 생략"
+
+    entry = log[recent_date]
+    lines = [f"[{recent_date} 추천 결과 검증]"]
+
+    correct = 0
+    total = 0
+
+    for rec in entry.get("추천종목", []):
+        ticker = rec.get("ticker")
+        rec_price = rec.get("추천가")
+        today_data = all_stock_data.get(ticker, {})
+        today_price = today_data.get("현재가")
+
+        if rec_price and today_price:
+            pct = (float(today_price) / float(rec_price) - 1) * 100
+            direction = rec.get("방향", "매수")
+            if direction == "매수":
+                correct_flag = "✅정확" if pct > 0 else "❌틀림"
+                correct += 1 if pct > 0 else 0
+            else:
+                correct_flag = "✅정확" if pct < 0 else "❌틀림"
+                correct += 1 if pct < 0 else 0
+            total += 1
+            lines.append(f"  {rec.get('name','?')}({ticker}): 추천가 {rec_price} → 오늘 {today_price} ({pct:+.1f}%) {correct_flag}")
+        else:
+            lines.append(f"  {rec.get('name','?')}({ticker}): 비교 불가")
+
+    for rec in entry.get("즉시매도", []):
+        ticker = rec.get("ticker")
+        rec_price = rec.get("매도가")
+        today_data = all_stock_data.get(ticker, {})
+        today_price = today_data.get("현재가")
+        if rec_price and today_price:
+            pct = (float(today_price) / float(rec_price) - 1) * 100
+            correct_flag = "✅정확(계속하락)" if pct < 0 else "⚠️반등(매도타이밍재검토)"
+            lines.append(f"  {rec.get('name','?')} 매도 후: {pct:+.1f}% {correct_flag}")
+
+    market_call = entry.get("시장판단", "")
+    if market_call:
+        lines.append(f"  전일 시장 판단: {market_call}")
+
+    if total > 0:
+        accuracy = correct / total * 100
+        lines.append(f"  종목 판단 정확도: {correct}/{total} ({accuracy:.0f}%)")
+
+    all_correct = sum(d.get("판단정확도_맞춤", 0) for d in log.values())
+    all_total   = sum(d.get("판단정확도_전체", 0) for d in log.values())
+    if all_total > 0:
+        lines.append(f"  누적 판단 정확도: {all_correct}/{all_total} ({all_correct/all_total*100:.0f}%) — {len(log)}일 누적")
+
+    return "\n".join(lines)
+
+
 # ── 포트폴리오 사전 계산 ─────────────────────────────────────────────────────
 def calc_portfolio_summary(portfolio_data, stock_data, exchange_rate):
     pf = portfolio_data
@@ -826,6 +910,7 @@ def generate_report(us_data, kr_data, exchange_rate,
 
     all_stock_data = {**us_data, **kr_data}
     portfolio_calc = calc_portfolio_summary(pf, all_stock_data, exchange_rate)
+    yesterdays_verification = build_yesterdays_verification(all_stock_data, exchange_rate)
 
     static_system = """너는 500만원에서 시작해 자산 10억 이상을 달성한 전문 퀀트 트레이더이자 포트폴리오 매니저다.
 목표는 단 하나 — 사용자가 최대한 많은 돈을 버는 것.
@@ -1304,24 +1389,22 @@ PWFL(파워플리트) 판단 원칙:
 □ 데이터 이상 ⚠️ 항목 — 직접 확인 후 판단
 보고서는 방향을 제시하지만 최종 판단은 본인이 한다.
 
-[포트폴리오 계산 절대 원칙]
-user_content에 "[포트폴리오 사전 계산값]" 섹션이 제공된다.
-- 총자산, 평가손익, 수익률은 이 사전 계산값을 그대로 사용하라. 절대 직접 계산하지 마라.
-- 사전 계산값과 다른 수치를 보고서에 쓰는 것을 금지한다.
-- "현재가 미수집 → 0원"으로 표시된 종목은 계산에서 제외하고 "(시가 미수집)" 명시.
+[카테고리3 신규 진입 종목 검증 — 절대 규칙]
+보고서에 제공되는 [포트폴리오 사전 계산값]의 카테고리3 보유 종목 목록을 먼저 확인하라.
+이미 카테고리3에 보유 중인 종목은 절대로 "신규 진입"으로 쓰지 마라.
+보유 중이면 반드시 "추가매수" 항목으로만 작성하라.
+신규 진입은 카테고리1, 2, 3 어디에도 없는 완전히 새로운 종목이어야 한다.
+예: 카테고리3에 RGTI가 보유 중으로 표시돼 있으면
+    RGTI는 신규 진입이 아니라 추가매수다. 신규 진입 목록에 RGTI를 넣으면 오류다.
 
-[카테고리3 신규 진입 종목 검증]
-이번 달 실행 전략의 "신규 진입 종목" 선정 전 반드시 확인:
-- category3에 이미 보유 중인 종목은 "신규 진입"이 아닌 "추가매수" 또는 "홀딩"으로만 표시.
-- 신규 진입은 category1, category2, category3 어디에도 없는 종목이어야 한다.
-
-[액션플랜 자금 검증]
-액션플랜 작성 전 자금 흐름을 반드시 계산하라:
-- 총 회수금액 = 매도 종목들의 매도금액 합산
-- 총 투입금액 = 매수 종목들의 매수금액 합산
-- 총 회수금액 >= 총 투입금액 이어야 한다. 부족하면 매수 수량을 줄여라.
-- 액션플랜 마지막에 한 줄 요약 필수:
-  예: "총 회수 935만원 → 총 투입 890만원 → 잔여 현금 +45만원"
+[자기학습 원칙 — 전일 검증 데이터 활용]
+user_content에 [전일 추천 검증 데이터]가 제공된다.
+이 데이터를 반드시 활용해서 🔄 전일 대비 자기학습 섹션을 작성하라.
+- ✅정확 판정이 많으면: 해당 판단 기준을 오늘도 유지하라
+- ❌틀림 판정이 많으면: 오늘 보고서에서 그 종목/섹터 판단을 한 단계 보수적으로 조정하라
+- 누적 판단 정확도가 60% 미만이면: 오늘 보고서 전체 판단을 한 단계씩 보수적으로 조정하라
+- 누적 판단 정확도가 80% 이상이면: 현재 판단 기준이 유효함을 명시하라
+데이터가 없으면 "전일 보고서 없음 — 자기학습 생략"으로 표시하라.
 
 [WTI/Gold 수집 실패 원인 구분]
 데이터가 None인 경우 아래 둘 중 하나로 구분해서 표시:
@@ -1330,11 +1413,25 @@ user_content에 "[포트폴리오 사전 계산값]" 섹션이 제공된다.
 단순히 "수집 실패"로만 표시하지 마라.
 
 [카테고리1 적립 종목 판단 구분]
-GOOGL/FCX/VOO에 대한 🟢추가매수 판단 시 반드시 구분:
-- "적립 지속 (신규 자금 투입 없음)"
-- "적립 외 신규 자금 X원 추가 투입 권고"
+GOOGL/FCX/VOO에 대한 판단 시 반드시 구분:
+- "🟢 적립 지속 (신규 자금 투입 없음)"
+- "🟢 적립 외 신규 자금 X원 추가 투입 권고"
 신규 자금 추가 투입 권고는 매우 확실한 근거가 있을 때만 허용.
-카테고리1은 원칙상 단기 매도 금지이며 적립 지속이 기본이다."""
+카테고리1은 원칙상 단기 매도 금지이며 적립 지속이 기본이다.
+
+[포트폴리오 계산 절대 원칙]
+user_content에 [포트폴리오 사전 계산값] 섹션이 제공된다.
+총자산, 평가손익, 수익률은 이 사전 계산값을 그대로 사용하라.
+절대 직접 계산하지 마라. 사전 계산값과 다른 수치를 보고서에 쓰는 것을 금지한다.
+
+[액션플랜 자금 검증]
+액션플랜 작성 전 자금 흐름을 반드시 계산하라:
+- 총 회수금액 = 매도 종목들의 매도금액 합산
+- 총 투입금액 = 매수 종목들의 매수금액 합산
+- 총 회수금액 >= 총 투입금액 이어야 한다. 부족하면 매수 수량을 줄여라.
+- 액션플랜 마지막에 한 줄 요약 필수:
+  예: "총 회수 935만원 → 총 투입 890만원 → 잔여 현금 +45만원"
+"""
 
     static_system = (
         static_system
@@ -1344,6 +1441,7 @@ GOOGL/FCX/VOO에 대한 🟢추가매수 판단 시 반드시 구분:
 
     user_content = (
         f"[포트폴리오 사전 계산값 — 이 수치를 그대로 사용하라. 직접 계산 금지]\n{portfolio_calc}\n\n"
+        f"[전일 추천 검증 데이터 — 자기학습용]\n{yesterdays_verification}\n\n"
         f"오늘 날짜: {today}\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
         f"실시간 환율: {exchange_rate}원/달러\n\n"
@@ -1588,6 +1686,29 @@ def run_daily_report():
                              macro_data, fear_greed, insider_trades,
                              congress_trades, put_call_ratio, portfolio_data)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
+
+    # 오늘 종가를 learning_log에 저장 (다음날 검증용)
+    try:
+        all_stock_data = {**us_data, **kr_data}
+        log_entry = {
+            "추천종목": [],
+            "즉시매도": [],
+            "시장판단": "",
+            "판단정확도_맞춤": 0,
+            "판단정확도_전체": 0,
+        }
+        for ticker, data in all_stock_data.items():
+            price = data.get("현재가")
+            if price:
+                log_entry["추천종목"].append({
+                    "ticker": ticker,
+                    "name": ticker,
+                    "추천가": price,
+                    "방향": "매수"
+                })
+        save_learning_log(log_entry)
+    except Exception as e:
+        print(f"  learning_log 저장 실패: {e}", flush=True)
 
     print(f"\n[9/9] 이메일 발송", flush=True)
     send_email(report)
