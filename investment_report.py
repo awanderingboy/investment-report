@@ -1872,6 +1872,13 @@ user_content에 [백테스팅 결과]가 제공된다.
    불일치 발견 시 스코어카드를 TOP 3 등급에 맞춰 수정하라.
    보고서 출력 전 반드시 이 검증을 수행하라.
    특히 🔥 표시 종목은 스코어카드에서 반드시 💎강력매수로 표시해야 한다.
+
+[목표가/손절가 명시 원칙]
+모든 보유 종목의 상세 판단 섹션에서 반드시 아래 형식을 지켜라:
+- 단기 목표가: "단기 $XXX" 또는 "단기 XXX,XXX원"
+- 손절 트리거: "손절 트리거: $XXX" 또는 "손절 트리거: XXX,XXX원"
+이 형식이 없으면 자동 저장 시스템이 작동하지 않는다.
+카테고리1 적립 종목도 반드시 단기 목표가와 손절 트리거를 명시하라.
 """
 
     static_system = (
@@ -1918,10 +1925,34 @@ user_content에 [백테스팅 결과]가 제공된다.
         final = stream.get_final_message()
 
     print("  [Claude API] 응답 완료", flush=True)
+    report = ""
     for block in final.content:
         if block.type == "text":
-            return block.text
-    return ""
+            report = block.text
+            break
+
+    # 목표가/손절가 파싱 후 반환
+    import re
+    targets = {}
+    for line in report.split("\n"):
+        for cat in ["category1", "category2", "category3"]:
+            for it in pf.get(cat, []):
+                ticker = it["ticker"]
+                name = it["name"]
+                if name in line or ticker in line:
+                    m = re.search(r"단기\s*\$?([\d,]+)", line)
+                    if m:
+                        val = float(m.group(1).replace(",", ""))
+                        if ticker not in targets:
+                            targets[ticker] = {}
+                        targets[ticker]["target_price"] = val
+                    m2 = re.search(r"손절[^:]*:\s*\$?([\d,]+)", line)
+                    if m2:
+                        val2 = float(m2.group(1).replace(",", ""))
+                        if ticker not in targets:
+                            targets[ticker] = {}
+                        targets[ticker]["stop_loss"] = val2
+    return report, targets
 
 
 # ── 이메일 발송 ───────────────────────────────────────────────────────────────
@@ -2186,11 +2217,35 @@ def run_daily_report():
     earnings_data = get_earnings_data(US_TICKERS)
 
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
-    report = generate_report(us_data, kr_data, exchange_rate,
-                             macro_data, fear_greed, insider_trades,
-                             congress_trades, put_call_ratio, portfolio_data,
-                             news_data, earnings_data)
+    report, targets = generate_report(us_data, kr_data, exchange_rate,
+                                      macro_data, fear_greed, insider_trades,
+                                      congress_trades, put_call_ratio, portfolio_data,
+                                      news_data, earnings_data)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
+
+    # 목표가/손절가 portfolio.json에 자동 저장
+    try:
+        changed = False
+        for cat in ["category1", "category2", "category3"]:
+            for it in portfolio_data.get(cat, []):
+                ticker = it["ticker"]
+                if ticker in targets:
+                    for key, val in targets[ticker].items():
+                        if it.get(key) != val:
+                            it[key] = val
+                            changed = True
+                            print(f"  [TARGET] {it['name']}({ticker}) {key}: {val}", flush=True)
+        if changed:
+            with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+                json.dump(portfolio_data, f, ensure_ascii=False, indent=2)
+            import subprocess
+            repo = os.path.dirname(os.path.abspath(PORTFOLIO_FILE))
+            subprocess.run(["git", "-C", repo, "add", "portfolio.json"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", f"auto: 목표가/손절가 업데이트 {datetime.now().strftime('%Y-%m-%d')}"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "push"], capture_output=True)
+            print(f"  [TARGET] portfolio.json 저장 완료", flush=True)
+    except Exception as e:
+        print(f"  [TARGET] 저장 실패: {e}", flush=True)
 
     # 자동 검증 및 재시도
     all_stock_data = {**us_data, **kr_data}
@@ -2214,10 +2269,10 @@ def run_daily_report():
             still_missing = [t for t in missing if not all_stock_data.get(t, {}).get("현재가")]
             if not still_missing:
                 print(f"  재수집 성공 → 보고서 재생성", flush=True)
-                report = generate_report(us_data, kr_data, exchange_rate,
-                                        macro_data, fear_greed, insider_trades,
-                                        congress_trades, put_call_ratio, portfolio_data,
-                                        news_data, earnings_data)
+                report, targets = generate_report(us_data, kr_data, exchange_rate,
+                                                  macro_data, fear_greed, insider_trades,
+                                                  congress_trades, put_call_ratio, portfolio_data,
+                                                  news_data, earnings_data)
                 print(f"  → 재생성 완료 ({len(report)}자)", flush=True)
             else:
                 print(f"  재수집 실패 종목: {still_missing} — 원본 보고서 발송", flush=True)
