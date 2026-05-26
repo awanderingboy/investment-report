@@ -92,7 +92,7 @@ def load_portfolio() -> dict:
         return _HARDCODED_PORTFOLIO
 
 
-def _portfolio_section_str(pf: dict) -> str:
+def _portfolio_section_str(pf: dict, exchange_rate: float = None) -> str:
     lines = ["[포트폴리오 카테고리 - 3가지로 완전히 분리]\n"]
 
     lines.append("카테고리 1 - 주식 모으기 중 (매일 자동 적립, 절대 단기 매도 금지):")
@@ -109,8 +109,9 @@ def _portfolio_section_str(pf: dict) -> str:
     _cat3_cash_raw = pf.get("category3_cash", 5000000)
     cat3_seed = pf.get("category3_seed", 5000000)
     if _cat3_cash_raw == "auto":
+        _er = exchange_rate if exchange_rate else 1400
         _invested = sum(
-            it["shares"] * it["avg_price"] * 1400
+            it["shares"] * it["avg_price"] * _er
             if it["currency"] == "USD"
             else it["shares"] * it["avg_price"]
             for it in pf.get("category3", [])
@@ -1103,7 +1104,7 @@ def generate_report(us_data, kr_data, exchange_rate,
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     pf           = portfolio_data if portfolio_data is not None else _HARDCODED_PORTFOLIO
-    _pf_section  = _portfolio_section_str(pf)
+    _pf_section  = _portfolio_section_str(pf, exchange_rate)
     _restricted  = _restricted_tickers_list(pf)
 
     all_stock_data = {**us_data, **kr_data}
