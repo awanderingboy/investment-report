@@ -113,7 +113,7 @@ def check_alerts():
         currency = it["currency"]
         target = it.get("target_price")
         stop_loss = it.get("stop_loss")
-        is_dca = (cat == "category1")  # 적립 종목
+        is_dca = it.get("dca_alert", False)
 
         # 현재가 수집
         if currency == "KRW":
@@ -130,26 +130,41 @@ def check_alerts():
 
         pct = (price / avg - 1) * 100
 
-        # 목표가 도달 (적립 종목 포함)
-        if target and price >= float(target):
-            alerts.append(
-                f"🎯 <b>{name}({ticker}) 목표가 도달!</b>\n"
-                f"현재가: {price:,.2f} / 목표가: {float(target):,.2f}\n"
-                f"수익률: {pct:+.1f}%\n"
-                f"{'→ 적립 지속 (매도 금지)' if is_dca else '→ 분할 매도 검토 권고'}"
-            )
+        if is_dca:
+            # 적립식 전용 알림 — 급락 시 추가 적립 기회 안내만
+            if pct <= -5:
+                alerts.append(
+                    f"💰 <b>{name}({ticker}) 적립 추가 기회!</b>\n"
+                    f"현재가: {price:,.2f} (평단 대비 {pct:+.1f}%)\n"
+                    f"→ 평단보다 싸게 살 수 있는 기회\n"
+                    f"→ 적립 유지, 매도 금지"
+                )
+            # VIX 급등 시 적립 유지 독려
+            if vix_val and vix_val >= 22:
+                alerts.append(
+                    f"💪 <b>{name}({ticker}) 적립 유지하세요</b>\n"
+                    f"VIX {vix_val:.1f} 시장 불안 — 적립식은 이럴 때 더 효과적\n"
+                    f"→ 흔들리지 말고 적립 지속"
+                )
+        else:
+            # 일반 종목 알림
+            if target and price >= float(target):
+                alerts.append(
+                    f"🎯 <b>{name}({ticker}) 목표가 도달!</b>\n"
+                    f"현재가: {price:,.2f} / 목표가: {float(target):,.2f}\n"
+                    f"수익률: {pct:+.1f}%\n"
+                    f"→ 분할 매도 검토 권고"
+                )
+            if stop_loss and price <= float(stop_loss):
+                alerts.append(
+                    f"🚨 <b>{name}({ticker}) 손절가 이탈!</b>\n"
+                    f"현재가: {price:,.2f} / 손절가: {float(stop_loss):,.2f}\n"
+                    f"손실률: {pct:+.1f}%\n"
+                    f"→ 즉시 매도 검토 권고"
+                )
 
-        # 손절가 이탈 (적립 종목 제외)
-        if not is_dca and stop_loss and price <= float(stop_loss):
-            alerts.append(
-                f"🚨 <b>{name}({ticker}) 손절가 이탈!</b>\n"
-                f"현재가: {price:,.2f} / 손절가: {float(stop_loss):,.2f}\n"
-                f"손실률: {pct:+.1f}%\n"
-                f"→ 즉시 매도 검토 권고"
-            )
-
-        # 급등락 감지 (±5% 이상) → 목표가/손절가 자동 조정
-        if abs(pct) >= 5 and currency != "KRW":  # 한국주는 RSI 계산 불안정
+        # 급등락 감지 (±5% 이상) → 목표가/손절가 자동 조정 (적립 종목 제외)
+        if not is_dca and abs(pct) >= 5 and currency != "KRW":  # 한국주는 RSI 계산 불안정
             rsi = get_rsi(ticker)
             if rsi:
                 new_target = target
@@ -162,7 +177,7 @@ def check_alerts():
                     change_reason.append(f"RSI {rsi:.1f} 과열")
 
                 # RSI 과매도 → 손절가 하향 (숨쉴 공간)
-                if rsi <= 30 and stop_loss and not is_dca:
+                if rsi <= 30 and stop_loss:
                     new_stop = round(float(stop_loss) * 0.97, 2)
                     change_reason.append(f"RSI {rsi:.1f} 과매도")
 
