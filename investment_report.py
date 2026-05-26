@@ -155,17 +155,30 @@ def get_macro_data():
         "WTI":  "CL=F",
         "Gold": "GC=F",
     }
+    _range_bounds = {
+        "VIX":  (10,   80),
+        "DXY":  (85,  115),
+        "WTI":  (50,   90),
+        "Gold": (1800, 4000),
+    }
     results = {}
     for name, ticker in macro_tickers.items():
         try:
             t = yf.Ticker(ticker)
-            hist = t.history(period="5d", auto_adjust=True)
+            fetch_period = "2d" if name in ("WTI", "Gold") else "5d"
+            hist = t.history(period=fetch_period, auto_adjust=True)
             if hist.empty:
                 print(f"  [{name}] 데이터 없음", flush=True)
                 results[name] = None
                 continue
             close = hist["Close"].astype(float).dropna()
             current = close.iloc[-1]
+            if name in _range_bounds:
+                lo, hi = _range_bounds[name]
+                if not (lo <= current <= hi):
+                    print(f"  ⚠️ [{name}] 범위 이탈 ({round(current, 2)}) — None 처리", flush=True)
+                    results[name] = None
+                    continue
             change_pct = round((current / close.iloc[-2] - 1) * 100, 2) if len(close) >= 2 else None
             results[name] = {"value": round(current, 2), "change_pct": change_pct}
             chg_str = f" ({change_pct:+.2f}%)" if change_pct is not None else ""
@@ -595,6 +608,13 @@ def get_stock_data(tickers):
             ma20  = _calc_ma(close, 20)  if close is not None else None
             ma60  = _calc_ma(close, 60)  if close is not None else None
             ma120 = _calc_ma(close, 120) if close is not None else None
+
+            if ma20 is not None:
+                if current_price > ma20 * 2 or current_price < ma20 * 0.5:
+                    print(f"    ⚠️ [{ticker}] 현재가({round(current_price, 2)})와 MA20({round(ma20, 2)}) 괴리 50%+ — 오류 의심, None 처리", flush=True)
+                    current_price = None
+            if current_price is None:
+                continue
 
             aligned = (
                 all(v is not None for v in [ma5, ma20, ma60, ma120]) and
