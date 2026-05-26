@@ -1138,6 +1138,45 @@ def calc_portfolio_summary(portfolio_data, stock_data, exchange_rate):
     return "\n".join(lines)
 
 
+# ── 보고서 자동 검증 ──────────────────────────────────────────────────────────
+def validate_report(report: str, pf: dict, all_stock_data: dict, exchange_rate: float) -> list:
+    errors = []
+    import re
+
+    # 1. 카테고리3 현황 검증
+    cat3 = pf.get("category3", [])
+    if cat3:
+        for it in cat3:
+            ticker = it["ticker"]
+            if not all_stock_data.get(ticker, {}).get("현재가"):
+                errors.append(f"[카테고리3 주가 미수집] {it['name']}({ticker})")
+        if "전액 현금 대기 중" in report or "현재 투자 중 금액\t0원" in report:
+            errors.append(f"[카테고리3 현황 오류] 보유 종목 {len(cat3)}개 있으나 전액 현금으로 표시됨")
+
+    # 2. 총자산 검증 (Python 계산값 vs 보고서 수치 5% 이상 차이 시 오류)
+    calc_result = calc_portfolio_summary(pf, all_stock_data, exchange_rate)
+    total_line = [l for l in calc_result.split("\n") if "총합계" in l]
+    if total_line:
+        match = re.search(r"([\d,]+)원", total_line[0])
+        if match:
+            calc_total = int(match.group(1).replace(",", ""))
+            report_match = re.search(r"총합.*?([\d,]+)원", report)
+            if report_match:
+                report_total = int(report_match.group(1).replace(",", ""))
+                diff_pct = abs(calc_total - report_total) / calc_total * 100
+                if diff_pct > 5:
+                    errors.append(f"[총자산 계산 오류] Python {calc_total:,}원 vs 보고서 {report_total:,}원 ({diff_pct:.1f}% 차이)")
+
+    # 3. 주가 이상치 검증
+    for ticker, data in all_stock_data.items():
+        price = data.get("현재가")
+        hist_avg = data.get("hist_avg")
+        if price and hist_avg and abs(price / hist_avg - 1) > 0.3:
+            errors.append(f"[주가 이상치] {ticker}: 현재가 {price} vs 5일평균 {hist_avg:.0f} ({(price/hist_avg-1)*100:+.1f}%)")
+
+    return errors
+
+
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
@@ -1969,6 +2008,38 @@ def run_daily_report():
                              congress_trades, put_call_ratio, portfolio_data,
                              news_data, earnings_data)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
+
+    # 자동 검증 및 재시도
+    all_stock_data = {**us_data, **kr_data}
+    validation_errors = validate_report(report, portfolio_data, all_stock_data, exchange_rate)
+
+    if validation_errors:
+        print(f"\n⚠️  검증 오류 {len(validation_errors)}개 발견:", flush=True)
+        for err in validation_errors:
+            print(f"  - {err}", flush=True)
+
+        # 카테고리3 주가 미수집 시 재수집 후 재생성
+        cat3_tickers = [it["ticker"] for it in portfolio_data.get("category3", [])]
+        missing = [t for t in cat3_tickers if not all_stock_data.get(t, {}).get("현재가")]
+        if missing:
+            print(f"\n  재수집 시도: {missing}", flush=True)
+            retry_data = get_stock_data(missing)
+            all_stock_data.update(retry_data)
+            us_data.update({k: v for k, v in retry_data.items() if not (k.endswith(".KS") or k.endswith(".KQ"))})
+            kr_data.update({k: v for k, v in retry_data.items() if k.endswith(".KS") or k.endswith(".KQ")})
+
+            still_missing = [t for t in missing if not all_stock_data.get(t, {}).get("현재가")]
+            if not still_missing:
+                print(f"  재수집 성공 → 보고서 재생성", flush=True)
+                report = generate_report(us_data, kr_data, exchange_rate,
+                                        macro_data, fear_greed, insider_trades,
+                                        congress_trades, put_call_ratio, portfolio_data,
+                                        news_data, earnings_data)
+                print(f"  → 재생성 완료 ({len(report)}자)", flush=True)
+            else:
+                print(f"  재수집 실패 종목: {still_missing} — 원본 보고서 발송", flush=True)
+    else:
+        print(f"\n✅ 검증 통과 — 오류 없음", flush=True)
 
     # learning_log 저장
     try:
