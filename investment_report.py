@@ -164,32 +164,180 @@ def get_macro_data():
         "WTI":  (50,   90),
         "Gold": (1800, 4000),
     }
+    _fallback_urls = {
+        "WTI":  "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=1d&range=5d",
+        "Gold": "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=5d",
+    }
     results = {}
     for name, ticker in macro_tickers.items():
+        current = None
+        close_series = []
+
+        # 1순위: yfinance
         try:
             t = yf.Ticker(ticker)
             fetch_period = "2d" if name in ("WTI", "Gold") else "5d"
             hist = t.history(period=fetch_period, auto_adjust=True)
-            if hist.empty:
-                print(f"  [{name}] 데이터 없음", flush=True)
+            if not hist.empty:
+                close = hist["Close"].astype(float).dropna()
+                if not close.empty:
+                    current = float(close.iloc[-1])
+                    close_series = close.tolist()
+        except Exception as e:
+            print(f"  [{name}] yfinance 실패: {e}", flush=True)
+
+        # 2순위: Yahoo Finance JSON API (WTI/Gold 전용)
+        if current is None and name in _fallback_urls:
+            try:
+                resp = requests.get(_fallback_urls[name], headers=HEADERS, timeout=10)
+                if resp.status_code == 200:
+                    closes = resp.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                    closes = [c for c in closes if c is not None]
+                    if closes:
+                        current = float(closes[-1])
+                        close_series = closes
+                        print(f"  [{name}] Yahoo JSON API 폴백 사용", flush=True)
+            except Exception as e:
+                print(f"  [{name}] Yahoo JSON API 폴백 실패: {e}", flush=True)
+
+        if current is None:
+            print(f"  [{name}] 데이터 없음", flush=True)
+            results[name] = None
+            continue
+
+        # 범위 검증
+        if name in _range_bounds:
+            lo, hi = _range_bounds[name]
+            if not (lo <= current <= hi):
+                print(f"  ⚠️ [{name}] 범위 이탈 ({round(current, 2)}) — None 처리", flush=True)
                 results[name] = None
                 continue
-            close = hist["Close"].astype(float).dropna()
-            current = close.iloc[-1]
-            if name in _range_bounds:
-                lo, hi = _range_bounds[name]
-                if not (lo <= current <= hi):
-                    print(f"  ⚠️ [{name}] 범위 이탈 ({round(current, 2)}) — None 처리", flush=True)
-                    results[name] = None
-                    continue
-            change_pct = round((current / close.iloc[-2] - 1) * 100, 2) if len(close) >= 2 else None
-            results[name] = {"value": round(current, 2), "change_pct": change_pct}
-            chg_str = f" ({change_pct:+.2f}%)" if change_pct is not None else ""
-            print(f"  [{name}] {round(current, 2)}{chg_str}", flush=True)
-        except Exception as e:
-            print(f"  [{name}] 수집 실패: {e}", flush=True)
-            results[name] = None
+
+        change_pct = round((current / close_series[-2] - 1) * 100, 2) if len(close_series) >= 2 else None
+        results[name] = {"value": round(current, 2), "change_pct": change_pct}
+        chg_str = f" ({change_pct:+.2f}%)" if change_pct is not None else ""
+        print(f"  [{name}] {round(current, 2)}{chg_str}", flush=True)
     return results
+
+
+# ── 뉴스 수집 ─────────────────────────────────────────────────────────────────
+def get_news_data(tickers: list) -> dict:
+    print("  뉴스 데이터 수집 중...", flush=True)
+    results = {}
+    us_tickers = [t for t in tickers if not (t.endswith(".KS") or t.endswith(".KQ"))]
+    for ticker in us_tickers:
+        try:
+            url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+            resp = requests.get(url, headers=HEADERS, timeout=8)
+            if resp.status_code == 200:
+                root = ET.fromstring(resp.content)
+                items = root.findall(".//item")[:3]
+                news = []
+                for item in items:
+                    title = item.findtext("title", "").strip()
+                    pubdate = item.findtext("pubDate", "").strip()
+                    if title:
+                        news.append(f"[{pubdate[:16]}] {title}")
+                if news:
+                    results[ticker] = news
+                    print(f"    [{ticker}] 뉴스 {len(news)}건", flush=True)
+        except Exception as e:
+            print(f"    [{ticker}] 뉴스 수집 실패: {e}", flush=True)
+
+    kr_tickers = [t for t in tickers if t.endswith(".KS") or t.endswith(".KQ")]
+    for ticker in kr_tickers:
+        try:
+            code = ticker.split(".")[0]
+            url = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
+            resp = requests.get(url, headers={**HEADERS, "Referer": "https://finance.naver.com"}, timeout=8)
+            if resp.status_code == 200 and BS4_AVAILABLE:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                items = soup.select("table.type5 td.title a")[:3]
+                news = [item.get_text(strip=True) for item in items if item.get_text(strip=True)]
+                if news:
+                    results[ticker] = news
+                    print(f"    [{ticker}] 뉴스 {len(news)}건", flush=True)
+        except Exception as e:
+            print(f"    [{ticker}] 뉴스 수집 실패: {e}", flush=True)
+    return results
+
+
+# ── 실적 수집 ─────────────────────────────────────────────────────────────────
+def get_earnings_data(tickers: list) -> dict:
+    print("  실적 데이터 수집 중...", flush=True)
+    results = {}
+    us_tickers = [t for t in tickers if not (t.endswith(".KS") or t.endswith(".KQ"))]
+    for ticker in us_tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            cal = stock.calendar
+            next_date = None
+            if cal is not None:
+                if hasattr(cal, 'get'):
+                    next_date = cal.get("Earnings Date")
+                elif hasattr(cal, 'columns') and "Earnings Date" in cal.columns:
+                    next_date = cal["Earnings Date"].iloc[0] if len(cal) > 0 else None
+            fin = stock.quarterly_financials
+            entry = {}
+            if next_date is not None:
+                if hasattr(next_date, '__iter__') and not isinstance(next_date, str):
+                    next_date = list(next_date)[0]
+                entry["다음실적발표"] = str(next_date)[:10]
+            if fin is not None and not fin.empty:
+                if "Total Revenue" in fin.index:
+                    rev = fin.loc["Total Revenue"].iloc[0]
+                    entry["최근분기매출"] = f"${rev/1e9:.2f}B" if rev else "N/A"
+                if "Net Income" in fin.index:
+                    ni = fin.loc["Net Income"].iloc[0]
+                    entry["최근분기순이익"] = f"${ni/1e9:.2f}B" if ni else "N/A"
+            if entry:
+                results[ticker] = entry
+                print(f"    [{ticker}] 실적 수집 완료", flush=True)
+        except Exception as e:
+            print(f"    [{ticker}] 실적 수집 실패: {e}", flush=True)
+    return results
+
+
+# ── 백테스팅 ──────────────────────────────────────────────────────────────────
+def run_backtest(portfolio_data: dict, stock_data_all: dict, exchange_rate: float) -> str:
+    print("  백테스팅 실행 중...", flush=True)
+    lines = ["[백테스팅 — 보유 종목 vs VOO 벤치마크]"]
+    voo_data = stock_data_all.get("VOO", {})
+    voo_1m = voo_data.get("1개월_수익률")
+    voo_3m = voo_data.get("3개월_수익률")
+    voo_6m = voo_data.get("6개월_수익률")
+    if voo_1m:
+        lines.append(f"  VOO 벤치마크: 1M {voo_1m:+.1f}% / 3M {voo_3m:+.1f}% / 6M {voo_6m:+.1f}%")
+    all_holdings = (
+        portfolio_data.get("category1", []) +
+        portfolio_data.get("category2", []) +
+        portfolio_data.get("category3", [])
+    )
+    outperform = 0
+    total_compared = 0
+    for it in all_holdings:
+        ticker = it["ticker"]
+        avg_price = it["avg_price"]
+        data = stock_data_all.get(ticker, {})
+        current_price = data.get("현재가")
+        if not current_price:
+            continue
+        total_return = (float(current_price) / float(avg_price) - 1) * 100
+        m1 = data.get("1개월_수익률") or 0
+        m3 = data.get("3개월_수익률") or 0
+        m6 = data.get("6개월_수익률") or 0
+        vs_voo_1m = m1 - (voo_1m or 0)
+        beat = "✅초과" if vs_voo_1m > 0 else "❌미달"
+        if voo_1m:
+            total_compared += 1
+            if vs_voo_1m > 0:
+                outperform += 1
+        lines.append(
+            f"  {it['name']}({ticker}): 진입후 {total_return:+.1f}% | 1M {m1:+.1f}% vs VOO {voo_1m:+.1f}% → {beat}"
+        )
+    if total_compared > 0:
+        lines.append(f"  포트폴리오 vs VOO 초과 성과: {outperform}/{total_compared} ({outperform/total_compared*100:.0f}%)")
+    return "\n".join(lines)
 
 
 # ── Fear & Greed Index ────────────────────────────────────────────────────────
@@ -505,6 +653,32 @@ def _fmt_pcr(pcr):
         return "⚠️ Put/Call Ratio 수집 실패 - 수동 확인 필요"
     interp = f" / {pcr['interpretation']}" if pcr.get("interpretation") else ""
     return f"{pcr['ratio']} (출처: {pcr['source']}){interp}"
+
+def _fmt_news(news_data: dict) -> str:
+    if not news_data:
+        return "뉴스 데이터 수집 실패"
+    lines = []
+    for ticker, news_list in news_data.items():
+        lines.append(f"[{ticker}]")
+        for n in news_list:
+            lines.append(f"  - {n}")
+    return "\n".join(lines) if lines else "뉴스 없음"
+
+def _fmt_earnings(earnings_data: dict) -> str:
+    if not earnings_data:
+        return "실적 데이터 수집 실패"
+    lines = []
+    for ticker, info in earnings_data.items():
+        parts = []
+        if "다음실적발표" in info:
+            parts.append(f"다음발표: {info['다음실적발표']} (earnings.com 직접 확인 필수)")
+        if "최근분기매출" in info:
+            parts.append(f"최근매출: {info['최근분기매출']}")
+        if "최근분기순이익" in info:
+            parts.append(f"순이익: {info['최근분기순이익']}")
+        if parts:
+            lines.append(f"[{ticker}] " + " / ".join(parts))
+    return "\n".join(lines) if lines else "실적 데이터 없음"
 
 
 # ── 기술적 지표 계산 ──────────────────────────────────────────────────────────
@@ -899,7 +1073,8 @@ def calc_portfolio_summary(portfolio_data, stock_data, exchange_rate):
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
-                    congress_trades, put_call_ratio, portfolio_data=None):
+                    congress_trades, put_call_ratio, portfolio_data=None,
+                    news_data=None, earnings_data=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today = datetime.now().strftime("%Y년 %m월 %d일")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -911,6 +1086,7 @@ def generate_report(us_data, kr_data, exchange_rate,
     all_stock_data = {**us_data, **kr_data}
     portfolio_calc = calc_portfolio_summary(pf, all_stock_data, exchange_rate)
     yesterdays_verification = build_yesterdays_verification(all_stock_data, exchange_rate)
+    backtest_result = run_backtest(pf, all_stock_data, exchange_rate)
 
     static_system = """너는 500만원에서 시작해 자산 10억 이상을 달성한 전문 퀀트 트레이더이자 포트폴리오 매니저다.
 목표는 단 하나 — 사용자가 최대한 많은 돈을 버는 것.
@@ -1431,6 +1607,31 @@ user_content에 [포트폴리오 사전 계산값] 섹션이 제공된다.
 - 총 회수금액 >= 총 투입금액 이어야 한다. 부족하면 매수 수량을 줄여라.
 - 액션플랜 마지막에 한 줄 요약 필수:
   예: "총 회수 935만원 → 총 투입 890만원 → 잔여 현금 +45만원"
+
+[뉴스 데이터 활용 원칙]
+user_content에 [종목별 최신 뉴스]가 제공된다.
+- 보유 종목 관련 뉴스는 반드시 판단에 반영하라
+- 긍정 뉴스(실적 호조, 계약, 승인): 판단 한 단계 상향 검토
+- 부정 뉴스(실적 부진, 소송, 리콜): 판단 한 단계 하향 검토
+- 뉴스가 없는 종목은 "(최신 뉴스 없음)"으로 표시
+- 수집된 뉴스는 실제 데이터이므로 (※AI 학습 데이터 기반) 표시 붙이지 않는다
+
+[실적 데이터 활용 원칙]
+user_content에 [종목별 실적 데이터]가 제공된다.
+- 다음 실적 발표일이 이번 주 이내면 반드시 📅 이번 주 핵심 이벤트에 포함
+- 실적 발표일 앞에는 항상 "earnings.com 직접 확인 필수" 추가
+- 최근 분기 매출/순이익을 포트폴리오 진단 판단 근거에 활용하라
+
+[백테스팅 활용 원칙]
+user_content에 [백테스팅 결과]가 제공된다.
+- VOO 대비 초과 성과 종목은 판단에 긍정적으로 반영
+- VOO 대비 미달 종목이 3개월 이상 지속되면 비중축소 검토
+- 포트폴리오 전체 VOO 초과 성과 비율을 보고서 서두에 한 줄 명시하라
+
+[판단 일관성 자가검증 추가 항목]
+⑤ 종합 추천 TOP 3의 판단 등급과 스코어카드의 판단 등급이 일치하는가?
+   → TOP 3에 💎강력매수로 표시했으면 스코어카드도 반드시 💎강력매수여야 한다.
+   → 불일치 시 둘 중 더 보수적인 등급으로 통일하라.
 """
 
     static_system = (
@@ -1441,6 +1642,9 @@ user_content에 [포트폴리오 사전 계산값] 섹션이 제공된다.
 
     user_content = (
         f"[포트폴리오 사전 계산값 — 이 수치를 그대로 사용하라. 직접 계산 금지]\n{portfolio_calc}\n\n"
+        f"[백테스팅 결과 — 보유 종목 vs VOO]\n{backtest_result}\n\n"
+        f"[종목별 최신 뉴스]\n{_fmt_news(news_data)}\n\n"
+        f"[종목별 실적 데이터]\n{_fmt_earnings(earnings_data)}\n\n"
         f"[전일 추천 검증 데이터 — 자기학습용]\n{yesterdays_verification}\n\n"
         f"오늘 날짜: {today}\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
@@ -1651,43 +1855,52 @@ def run_daily_report():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 보고서 생성 시작", flush=True)
     print(f"{'='*50}", flush=True)
 
-    print(f"\n[0/9] 포트폴리오 로드", flush=True)
+    print(f"\n[0/11] 포트폴리오 로드", flush=True)
     portfolio_data = load_portfolio()
 
-    print(f"\n[1/9] 환율 조회", flush=True)
+    print(f"\n[1/11] 환율 조회", flush=True)
     exchange_rate = get_exchange_rate()
 
-    print(f"\n[2/9] 거시경제 지표 수집 (VIX, DXY, 금리, 원유, 금)", flush=True)
+    print(f"\n[2/11] 거시경제 지표 수집", flush=True)
     macro_data = get_macro_data()
 
-    print(f"\n[3/9] Fear & Greed Index 수집", flush=True)
+    print(f"\n[3/11] Fear & Greed Index 수집", flush=True)
     fear_greed = get_fear_greed()
 
-    print(f"\n[4/9] SEC 내부자 거래 수집", flush=True)
+    print(f"\n[4/11] SEC 내부자 거래 수집", flush=True)
     insider_trades = get_insider_trades()
 
-    print(f"\n[5/9] 정치인 거래 수집", flush=True)
+    print(f"\n[5/11] 정치인 거래 수집", flush=True)
     congress_trades = get_congress_trades()
 
-    print(f"\n[6/9] Put/Call Ratio 수집", flush=True)
+    print(f"\n[6/11] Put/Call Ratio 수집", flush=True)
     vix_val = (macro_data.get("VIX") or {}).get("value")
     put_call_ratio = get_put_call_ratio(vix_value=vix_val)
 
-    print(f"\n[7/9] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
+    print(f"\n[7/11] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
     us_data = get_stock_data(US_TICKERS)
     print(f"  → 수집 완료: {list(us_data.keys())}", flush=True)
 
-    print(f"\n[7/9] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
+    print(f"\n[8/11] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
     kr_data = get_stock_data(KR_TICKERS)
     print(f"  → 수집 완료: {list(kr_data.keys())}", flush=True)
 
-    print(f"\n[8/9] AI 분석 보고서 생성 (Claude Opus 4.7)", flush=True)
+    all_tickers = US_TICKERS + KR_TICKERS
+
+    print(f"\n[9/11] 뉴스 데이터 수집", flush=True)
+    news_data = get_news_data(all_tickers)
+
+    print(f"\n[10/11] 실적 데이터 수집", flush=True)
+    earnings_data = get_earnings_data(US_TICKERS)
+
+    print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report = generate_report(us_data, kr_data, exchange_rate,
                              macro_data, fear_greed, insider_trades,
-                             congress_trades, put_call_ratio, portfolio_data)
+                             congress_trades, put_call_ratio, portfolio_data,
+                             news_data, earnings_data)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
 
-    # 오늘 종가를 learning_log에 저장 (다음날 검증용)
+    # learning_log 저장
     try:
         all_stock_data = {**us_data, **kr_data}
         log_entry = {
@@ -1710,7 +1923,7 @@ def run_daily_report():
     except Exception as e:
         print(f"  learning_log 저장 실패: {e}", flush=True)
 
-    print(f"\n[9/9] 이메일 발송", flush=True)
+    print(f"\n이메일 발송", flush=True)
     send_email(report)
 
     print(f"\n{'='*50}", flush=True)
