@@ -54,7 +54,7 @@ def get_kr_price(code: str):
     except:
         return None
 
-def get_rsi(ticker: str, period: int = 14) -> float | None:
+def get_rsi(ticker: str, period: int = 14):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="30d", interval="1d")
@@ -69,7 +69,7 @@ def get_rsi(ticker: str, period: int = 14) -> float | None:
     except:
         return None
 
-def get_vix() -> float | None:
+def get_vix():
     try:
         vix = yf.Ticker("^VIX")
         hist = vix.history(period="1d", interval="5m")
