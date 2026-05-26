@@ -1384,9 +1384,6 @@ def run_daily_report():
     print(f"\n[9/9] 이메일 발송", flush=True)
     send_email(report)
 
-    print(f"\n[9/9] 텔레그램 발송", flush=True)
-    send_telegram(report)
-
     print(f"\n{'='*50}", flush=True)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 전체 완료", flush=True)
     print(f"{'='*50}\n", flush=True)
