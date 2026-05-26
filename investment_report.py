@@ -545,46 +545,74 @@ def _calc_volume_ratio(volume):
 def _get_current_price(stock, info, hist, ticker):
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
 
-    # 한국 주식: history 최근값 우선 (fast_info가 stale한 경우가 많음)
-    if is_kr:
-        if not hist.empty:
-            price = hist["Close"].dropna().iloc[-1]
-            if price and price > 0:
-                print(f"    [{ticker}] 현재가 출처: history[-1]", flush=True)
-                return price
+    # 5일 평균 (이상치 검증용)
+    hist_avg = None
+    if not hist.empty:
+        close5 = hist["Close"].dropna().tail(5)
+        if len(close5) >= 2:
+            hist_avg = float(close5.mean())
+
+    def _is_valid(price):
+        if price is None or price <= 0:
+            return False
+        if hist_avg is not None and abs(price / hist_avg - 1) > 0.30:
+            return False
+        return True
+
+    def _src_naver():
+        code = ticker.split(".")[0]
         try:
-            price = stock.fast_info.last_price
-            if price and price > 0:
-                print(f"    [{ticker}] 현재가 출처: fast_info (KR 폴백)", flush=True)
-                return price
+            url = f"https://finance.naver.com/item/main.nhn?code={code}"
+            resp = requests.get(url, headers=HEADERS, timeout=8)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                tag = soup.find("strong", id="_nowVal")
+                if tag:
+                    return float(tag.get_text(strip=True).replace(",", ""))
         except Exception:
             pass
-        for key in ("regularMarketPrice", "regularMarketPreviousClose"):
-            price = info.get(key)
-            if price and price > 0:
-                print(f"    [{ticker}] 현재가 출처: info[{key}] (KR 폴백)", flush=True)
-                return price
         return None
 
-    # 미국 주식: fast_info 우선 (실시간에 가까움)
-    try:
-        price = stock.fast_info.last_price
-        if price and price > 0:
-            print(f"    [{ticker}] 현재가 출처: fast_info", flush=True)
-            return price
-    except Exception:
-        pass
+    def _src_hist():
+        if not hist.empty:
+            close = hist["Close"].dropna()
+            if not close.empty:
+                return float(close.iloc[-1])
+        return None
 
-    for key in ("currentPrice", "regularMarketPrice"):
-        price = info.get(key)
-        if price and price > 0:
-            print(f"    [{ticker}] 현재가 출처: info[{key}]", flush=True)
-            return price
+    def _src_fast_info():
+        try:
+            p = stock.fast_info.last_price
+            return float(p) if p and p > 0 else None
+        except Exception:
+            return None
 
-    if not hist.empty:
-        print(f"    [{ticker}] 현재가 출처: hist 폴백", flush=True)
-        return hist["Close"].iloc[-1]
+    def _src_info_key():
+        for key in ("regularMarketPrice", "currentPrice"):
+            p = info.get(key)
+            if p and p > 0:
+                return float(p)
+        return None
 
+    sources = (
+        [("네이버금융", _src_naver), ("history[-1]", _src_hist), ("fast_info", _src_fast_info)]
+        if is_kr else
+        [("history[-1]", _src_hist), ("fast_info", _src_fast_info), ("info[regularMarketPrice]", _src_info_key)]
+    )
+
+    for name, fn in sources:
+        try:
+            price = fn()
+            if price and price > 0:
+                if _is_valid(price):
+                    print(f"    [{ticker}] 현재가 출처: {name} ({price})", flush=True)
+                    return price
+                avg_str = f"{hist_avg:.2f}" if hist_avg else "N/A"
+                print(f"    [{ticker}] {name} 이상치 ({price:.2f}, 5일평균 {avg_str}) — 다음 소스 시도", flush=True)
+        except Exception as e:
+            print(f"    [{ticker}] {name} 오류: {e}", flush=True)
+
+    print(f"    ⚠️ [{ticker}] 현재가 수집 실패 — 모든 소스 실패", flush=True)
     return None
 
 
