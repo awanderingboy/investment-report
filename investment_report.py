@@ -38,7 +38,28 @@ KR_TICKERS = [
     "042700.KS",  # 한미반도체
 ]
 INSIDER_TICKERS = ["NVDA", "GOOGL", "FCX", "PLTR", "BEAM", "PWFL", "VOO"]
+PORTFOLIO_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
 FEAR_GREED_CACHE = "/tmp/fear_greed_cache.json"
+
+_HARDCODED_PORTFOLIO = {
+    "cash": {"krw": 13585062, "usd": 3566},
+    "category1": [
+        {"ticker": "GOOGL", "name": "알파벳A",      "shares": 2.77,  "avg_price": 325.10,  "currency": "USD", "daily_buy": 25},
+        {"ticker": "FCX",   "name": "프리포트맥모란", "shares": 12.84, "avg_price": 61.53,   "currency": "USD", "daily_buy": 10},
+        {"ticker": "VOO",   "name": "VOO",           "shares": 3.39,  "avg_price": 621.68,  "currency": "USD", "daily_buy": 20},
+    ],
+    "category2": [
+        {"ticker": "068760.KS", "name": "셀트리온제약", "shares": 398,   "avg_price": 68287,  "currency": "KRW"},
+        {"ticker": "035720.KS", "name": "카카오",       "shares": 104,   "avg_price": 36151,  "currency": "KRW"},
+        {"ticker": "035420.KS", "name": "네이버",       "shares": 50,    "avg_price": 214000, "currency": "KRW"},
+        {"ticker": "BEAM",      "name": "빔테라퓨틱스", "shares": 100,   "avg_price": 32.49,  "currency": "USD"},
+        {"ticker": "NVDA",      "name": "엔비디아",     "shares": 10,    "avg_price": 178.84, "currency": "USD"},
+        {"ticker": "PLTR",      "name": "팔란티어",     "shares": 11.64, "avg_price": 142.36, "currency": "USD"},
+        {"ticker": "PWFL",      "name": "파워플리트",   "shares": 1200,  "avg_price": 3.68,   "currency": "USD"},
+    ],
+    "category3": [],
+    "category3_cash": 5000000,
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -46,6 +67,63 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 SEC_HEADERS = {"User-Agent": "investment-report-bot/1.0 xogus5512@gmail.com"}
+
+
+# ── 포트폴리오 로드 ──────────────────────────────────────────────────────────
+def load_portfolio() -> dict:
+    try:
+        with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+            pf = json.load(f)
+        print(f"  portfolio.json 로드 완료 (최종 수정: {pf.get('last_updated', '?')})", flush=True)
+        return pf
+    except FileNotFoundError:
+        print("  portfolio.json 없음, 하드코딩 기본값 사용", flush=True)
+        return _HARDCODED_PORTFOLIO
+    except Exception as e:
+        print(f"  portfolio.json 로드 실패 ({e}), 기본값 사용", flush=True)
+        return _HARDCODED_PORTFOLIO
+
+
+def _portfolio_section_str(pf: dict) -> str:
+    lines = ["[포트폴리오 카테고리 - 3가지로 완전히 분리]\n"]
+
+    lines.append("카테고리 1 - 주식 모으기 중 (매일 자동 적립, 절대 단기 매도 금지):")
+    for it in pf.get("category1", []):
+        avg = f"${it['avg_price']:.2f}" if it["currency"] == "USD" else f"{it['avg_price']:,.0f}원"
+        daily = f" / 매일 ${it['daily_buy']} 적립" if it.get("daily_buy") else ""
+        lines.append(f"- {it['name']}({it['ticker']}): 평단 {avg} / {it['shares']}주{daily}")
+
+    lines.append("\n카테고리 2 - 현재 보유 중 (적립 없음, 매매 판단 필요):")
+    for it in pf.get("category2", []):
+        avg = f"${it['avg_price']:.2f}" if it["currency"] == "USD" else f"{it['avg_price']:,.0f}원"
+        lines.append(f"- {it['name']}({it['ticker']}): 평단 {avg} / {it['shares']}주")
+
+    cat3_cash     = pf.get("category3_cash", 5000000)
+    cat3_holdings = pf.get("category3", [])
+    lines.append("\n카테고리 3 - 500만원 프로젝트 (다른 포트폴리오와 완전 분리):")
+    lines.append(f"- 시드 현금: {cat3_cash:,}원")
+    if cat3_holdings:
+        lines.append("- 현재 보유:")
+        for it in cat3_holdings:
+            avg = f"${it['avg_price']:.2f}" if it["currency"] == "USD" else f"{it['avg_price']:,.0f}원"
+            lines.append(f"  * {it['name']}({it['ticker']}): 평단 {avg} / {it['shares']}주")
+    else:
+        lines.append("- 현재 미투자 (AI가 종목 추천)")
+    lines.append("- 목표: 6개월마다 2배, 최종 목표 1억")
+    lines.append("- 현재 단계: 1단계 (500만원 → 1,000만원)")
+
+    cash = pf.get("cash", {})
+    krw  = cash.get("krw", 0)
+    usd  = cash.get("usd", 0)
+    lines.append(f"\n보유 현금: {krw:,}원 + ${usd:,} (500만원 프로젝트 시드 별도)")
+    return "\n".join(lines)
+
+
+def _restricted_tickers_list(pf: dict) -> str:
+    names = []
+    for it in pf.get("category1", []) + pf.get("category2", []):
+        names.append(it["name"] if it["currency"] == "KRW" else it["ticker"])
+    return ", ".join(names)
 
 
 # ── 환율 조회 ─────────────────────────────────────────────────────────────────
@@ -561,38 +639,21 @@ def get_stock_data(tickers):
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
-                    congress_trades, put_call_ratio):
+                    congress_trades, put_call_ratio, portfolio_data=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today = datetime.now().strftime("%Y년 %m월 %d일")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    pf           = portfolio_data if portfolio_data is not None else _HARDCODED_PORTFOLIO
+    _pf_section  = _portfolio_section_str(pf)
+    _restricted  = _restricted_tickers_list(pf)
 
     static_system = """너는 500만원에서 시작해 자산 10억 이상을 달성한 전문 퀀트 트레이더이자 포트폴리오 매니저다.
 목표는 단 하나 — 사용자가 최대한 많은 돈을 버는 것.
 감정 없이 냉정하게, 데이터와 확률 기반으로 분석하라.
 손실 = 손절이 아님을 명심하라. 근거가 살아있으면 홀딩, 근거가 무너지면 손절.
 
-[포트폴리오 카테고리 - 3가지로 완전히 분리]
-
-카테고리 1 - 주식 모으기 중 (매일 자동 적립, 절대 단기 매도 금지):
-- 알파벳A(GOOGL): 평단 $325.10 / 2.77주 / 매일 $25 적립
-- 프리포트맥모란(FCX): 평단 $61.53 / 12.84주 / 매일 $10 적립
-- VOO: 평단 $621.68 / 3.39주 / 매일 $20 적립
-
-카테고리 2 - 현재 보유 중 (적립 없음, 매매 판단 필요):
-- 셀트리온제약: 평단 68,287원 / 398주
-- 카카오: 평단 36,151원 / 104주
-- 네이버: 평단 214,000원 / 50주
-- 빔 테라퓨틱스(BEAM): 평단 $32.49 / 100주
-- 엔비디아(NVDA): 평단 $178.84 / 10주
-- 팔란티어(PLTR): 평단 $142.36 / 11.64주
-- 파워플리트(PWFL): 평단 $3.68 / 1200주
-
-카테고리 3 - 500만원 프로젝트 (아직 미투자, AI가 종목 추천):
-- 시드: 현금 500만원 (다른 포트폴리오와 완전 분리)
-- 목표: 6개월마다 2배, 최종 목표 1억
-- 현재 단계: 1단계 (500만원 → 1,000만원)
-
-보유 현금: 13,585,062원 + $3,566 (500만원 프로젝트 시드 별도)
+__PORTFOLIO__
 
 아래 형식으로 보고서를 작성하라. 반드시 HTML로 작성하라.
 
@@ -760,7 +821,7 @@ AI/반도체/바이오/에너지전환/방산/양자컴퓨팅/UAM 등 메가트�
 리스크 시나리오: 시드 반토막 시 대응 전략.
 
 카테고리 3 절대 규칙:
-- 카테고리 1, 2에 있는 모든 종목(GOOGL, FCX, VOO, 셀트리온제약, 카카오, 네이버, BEAM, NVDA, PLTR, PWFL)은
+- 카테고리 1, 2에 있는 모든 종목(__RESTRICTED__)은
   이 섹션에 단 한 글자도 쓰지 마라. 언급 자체를 금지한다.
 - "대체 종목" "제외하고 대신" 같은 수정 흔적을 보고서에 절대 노출하지 마라.
   처음부터 새 종목만 깔끔하게 추천하라.
@@ -863,6 +924,12 @@ AI/반도체/바이오/에너지전환/방산/양자컴퓨팅/UAM 등 메가트�
   내부 검토 과정, 수정 흔적, 자기 수정 코멘트를 보고서에 절대 쓰지 마라.
 - 독자는 AI가 고민한 과정이 아니라 최종 판단만 원한다."""
 
+    static_system = (
+        static_system
+        .replace("__PORTFOLIO__", _pf_section)
+        .replace("__RESTRICTED__", _restricted)
+    )
+
     user_content = (
         f"오늘 날짜: {today}\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
@@ -963,40 +1030,43 @@ def run_daily_report():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 보고서 생성 시작", flush=True)
     print(f"{'='*50}", flush=True)
 
-    print(f"\n[0/8] 환율 조회", flush=True)
+    print(f"\n[0/9] 포트폴리오 로드", flush=True)
+    portfolio_data = load_portfolio()
+
+    print(f"\n[1/9] 환율 조회", flush=True)
     exchange_rate = get_exchange_rate()
 
-    print(f"\n[1/8] 거시경제 지표 수집 (VIX, DXY, 금리, 원유, 금)", flush=True)
+    print(f"\n[2/9] 거시경제 지표 수집 (VIX, DXY, 금리, 원유, 금)", flush=True)
     macro_data = get_macro_data()
 
-    print(f"\n[2/8] Fear & Greed Index 수집", flush=True)
+    print(f"\n[3/9] Fear & Greed Index 수집", flush=True)
     fear_greed = get_fear_greed()
 
-    print(f"\n[3/8] SEC 내부자 거래 수집", flush=True)
+    print(f"\n[4/9] SEC 내부자 거래 수집", flush=True)
     insider_trades = get_insider_trades()
 
-    print(f"\n[4/8] 정치인 거래 수집", flush=True)
+    print(f"\n[5/9] 정치인 거래 수집", flush=True)
     congress_trades = get_congress_trades()
 
-    print(f"\n[5/8] Put/Call Ratio 수집", flush=True)
+    print(f"\n[6/9] Put/Call Ratio 수집", flush=True)
     vix_val = (macro_data.get("VIX") or {}).get("value")
     put_call_ratio = get_put_call_ratio(vix_value=vix_val)
 
-    print(f"\n[6/8] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
+    print(f"\n[7/9] 미국 주식 데이터 수집 ({len(US_TICKERS)}개 종목)", flush=True)
     us_data = get_stock_data(US_TICKERS)
     print(f"  → 수집 완료: {list(us_data.keys())}", flush=True)
 
-    print(f"\n[6/8] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
+    print(f"\n[7/9] 국내 주식 데이터 수집 ({len(KR_TICKERS)}개 종목)", flush=True)
     kr_data = get_stock_data(KR_TICKERS)
     print(f"  → 수집 완료: {list(kr_data.keys())}", flush=True)
 
-    print(f"\n[7/8] AI 분석 보고서 생성 (Claude Opus 4.7)", flush=True)
+    print(f"\n[8/9] AI 분석 보고서 생성 (Claude Opus 4.7)", flush=True)
     report = generate_report(us_data, kr_data, exchange_rate,
                              macro_data, fear_greed, insider_trades,
-                             congress_trades, put_call_ratio)
+                             congress_trades, put_call_ratio, portfolio_data)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
 
-    print(f"\n[8/8] 이메일 발송", flush=True)
+    print(f"\n[9/9] 이메일 발송", flush=True)
     send_email(report)
 
     print(f"\n{'='*50}", flush=True)

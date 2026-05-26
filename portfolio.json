@@ -1,0 +1,26 @@
+{
+  "exchange_rate_note": "달러 종목은 달러 기준으로 저장",
+  "cash": {
+    "krw": 13585062,
+    "usd": 3566
+  },
+  "category1": [
+    {"ticker": "GOOGL", "name": "알파벳A",      "shares": 2.77,  "avg_price": 325.10,  "currency": "USD", "daily_buy": 25},
+    {"ticker": "FCX",   "name": "프리포트맥모란","shares": 12.84, "avg_price": 61.53,   "currency": "USD", "daily_buy": 10},
+    {"ticker": "VOO",   "name": "VOO",           "shares": 3.39,  "avg_price": 621.68,  "currency": "USD", "daily_buy": 20}
+  ],
+  "category2": [
+    {"ticker": "068760.KS", "name": "셀트리온제약", "shares": 398,   "avg_price": 68287,  "currency": "KRW"},
+    {"ticker": "035720.KS", "name": "카카오",       "shares": 104,   "avg_price": 36151,  "currency": "KRW"},
+    {"ticker": "035420.KS", "name": "네이버",       "shares": 50,    "avg_price": 214000, "currency": "KRW"},
+    {"ticker": "BEAM",      "name": "빔테라퓨틱스", "shares": 100,   "avg_price": 32.49,  "currency": "USD"},
+    {"ticker": "NVDA",      "name": "엔비디아",     "shares": 10,    "avg_price": 178.84, "currency": "USD"},
+    {"ticker": "PLTR",      "name": "팔란티어",     "shares": 11.64, "avg_price": 142.36, "currency": "USD"},
+    {"ticker": "PWFL",      "name": "파워플리트",   "shares": 1200,  "avg_price": 3.68,   "currency": "USD"}
+  ],
+  "category3": [
+    {"ticker": "042700.KS", "name": "한미반도체", "shares": 2, "avg_price": 323000, "currency": "KRW"}
+  ],
+  "category3_cash": 5000000,
+  "last_updated": "2026-05-26"
+}
