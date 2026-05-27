@@ -13,8 +13,7 @@
       "currency": "USD",
       "daily_buy": 25,
       "dca_alert": true,
-      "target_price": 410.0,
-      "stop_loss": 352.0
+      "target_price": 410.0
     },
     {
       "ticker": "FCX",
@@ -63,7 +62,7 @@
       "avg_price": 214000,
       "currency": "KRW",
       "target_price": 220000.0,
-      "stop_loss": 195000
+      "stop_loss": 40150.0
     },
     {
       "ticker": "BEAM",
@@ -72,7 +71,7 @@
       "avg_price": 32.49,
       "currency": "USD",
       "target_price": 145.0,
-      "stop_loss": 28.0
+      "stop_loss": 130.0
     },
     {
       "ticker": "NVDA",
