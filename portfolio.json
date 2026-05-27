@@ -12,7 +12,8 @@
       "avg_price": 351.9675,
       "currency": "USD",
       "daily_buy": 25,
-      "dca_alert": true
+      "dca_alert": true,
+      "target_price": 410.0
     },
     {
       "ticker": "FCX",
@@ -21,7 +22,8 @@
       "avg_price": 61.5638,
       "currency": "USD",
       "daily_buy": 10,
-      "dca_alert": true
+      "dca_alert": true,
+      "target_price": 70.0
     },
     {
       "ticker": "VOO",
@@ -30,7 +32,8 @@
       "avg_price": 622.2593,
       "currency": "USD",
       "daily_buy": 20,
-      "dca_alert": true
+      "dca_alert": true,
+      "target_price": 720.0
     }
   ],
   "category2": [
@@ -49,7 +52,7 @@
       "shares": 104,
       "avg_price": 36151,
       "currency": "KRW",
-      "target_price": 45000,
+      "target_price": 22.0,
       "stop_loss": 38000
     },
     {
@@ -58,7 +61,7 @@
       "shares": 50,
       "avg_price": 214000,
       "currency": "KRW",
-      "target_price": 225000,
+      "target_price": 220000.0,
       "stop_loss": 195000
     },
     {
@@ -85,8 +88,8 @@
       "shares": 6.64,
       "avg_price": 142.36,
       "currency": "USD",
-      "target_price": 150,
-      "stop_loss": 130
+      "target_price": 145.0,
+      "stop_loss": 120.0
     },
     {
       "ticker": "PWFL",
@@ -105,7 +108,7 @@
       "shares": 2,
       "avg_price": 323000,
       "currency": "KRW",
-      "target_price": 400000,
+      "target_price": 360000.0,
       "stop_loss": 290000
     },
     {
