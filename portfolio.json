@@ -143,13 +143,13 @@
       "ticker": "RGTI",
       "name": "리게티컴퓨팅",
       "total_units": 20,
-      "done_units": 0,
+      "done_units": 20,
       "unit_shares": 1,
       "start_shares": 50,
       "unit_amount_usd": 24.5,
       "memo": "카테고리3 $24~25 분할",
       "created_date": "2026-05-27",
-      "status": "진행중"
+      "status": "완료"
     }
   ],
   "executed_actions": [
