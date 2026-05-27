@@ -328,31 +328,32 @@ def get_macro_data():
 
 
 # ── 뉴스 수집 ─────────────────────────────────────────────────────────────────
-def get_news_data(tickers: list) -> dict:
+def get_news_data(tickers: list, portfolio_data: dict = None) -> dict:
     print("  뉴스 데이터 수집 중...", flush=True)
     results = {}
+
+    # 1. 보유 종목별 뉴스 수집
     us_tickers = [t for t in tickers if not (t.endswith(".KS") or t.endswith(".KQ"))]
+    kr_tickers = [t for t in tickers if t.endswith(".KS") or t.endswith(".KQ")]
+
+    # portfolio.json에서 종목명 자동 매핑
+    ticker_name_map = {}
+    if portfolio_data:
+        for cat in ["category1", "category2", "category3"]:
+            for it in portfolio_data.get(cat, []):
+                ticker_name_map[it["ticker"]] = it["name"]
+
+    # 미국 주식 뉴스
     for ticker in us_tickers:
         news = []
-
-        # 1순위: Yahoo RSS (region)
-        try:
-            url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
-            resp = requests.get(url, headers=HEADERS, timeout=8)
-            if resp.status_code == 200:
-                root = ET.fromstring(resp.content)
-                for item in root.findall(".//item")[:3]:
-                    title = item.findtext("title", "").strip()
-                    pubdate = item.findtext("pubDate", "").strip()
-                    if title:
-                        news.append(f"[{pubdate[:16]}] {title}")
-        except Exception:
-            pass
-
-        # 2순위: Yahoo RSS (alternative)
-        if not news:
+        urls = [
+            f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
+            f"https://finance.yahoo.com/rss/headline?s={ticker}",
+        ]
+        for url in urls:
+            if news:
+                break
             try:
-                url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
                 resp = requests.get(url, headers=HEADERS, timeout=8)
                 if resp.status_code == 200:
                     root = ET.fromstring(resp.content)
@@ -364,36 +365,81 @@ def get_news_data(tickers: list) -> dict:
             except Exception:
                 pass
 
-        # 3순위: 뉴스 수집 포기 — 안내 메시지
-        if not news:
-            try:
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
-                resp = requests.get(url, headers=HEADERS, timeout=8)
-                if resp.status_code == 200:
-                    news = [f"최신 뉴스 수집 실패 — 직접 확인 권고"]
-            except Exception:
-                news = [f"최신 뉴스 수집 실패 — 직접 확인 권고"]
-
         if news:
             results[ticker] = news
-            label = f"{len(news)}건" if news[0] != "최신 뉴스 수집 실패 — 직접 확인 권고" else "수집 실패"
-            print(f"    [{ticker}] 뉴스 {label}", flush=True)
+            print(f"    [{ticker}] 뉴스 {len(news)}건", flush=True)
+        else:
+            results[ticker] = ["최신 뉴스 수집 실패"]
+            print(f"    [{ticker}] 수집 실패", flush=True)
 
-    kr_tickers = [t for t in tickers if t.endswith(".KS") or t.endswith(".KQ")]
+    # 한국 주식 뉴스
     for ticker in kr_tickers:
+        news = []
+        code = ticker.split(".")[0]
         try:
-            code = ticker.split(".")[0]
             url = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
             resp = requests.get(url, headers={**HEADERS, "Referer": "https://finance.naver.com"}, timeout=8)
             if resp.status_code == 200 and BS4_AVAILABLE:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 items = soup.select("table.type5 td.title a")[:3]
                 news = [item.get_text(strip=True) for item in items if item.get_text(strip=True)]
-                if news:
-                    results[ticker] = news
-                    print(f"    [{ticker}] 뉴스 {len(news)}건", flush=True)
-        except Exception as e:
-            print(f"    [{ticker}] 뉴스 수집 실패: {e}", flush=True)
+        except Exception:
+            pass
+
+        if news:
+            results[ticker] = news
+            print(f"    [{ticker}] 뉴스 {len(news)}건", flush=True)
+        else:
+            results[ticker] = ["최신 뉴스 수집 실패"]
+
+    # 2. 섹터별 뉴스 수집 (신규 종목 발굴용)
+    sector_feeds = {
+        "AI_반도체": [
+            "https://feeds.finance.yahoo.com/rss/2.0/headline?s=NVDA,AMD,INTC,QCOM,AVGO&region=US&lang=en-US",
+            "https://news.google.com/rss/search?q=AI+semiconductor+stock&hl=en-US&gl=US&ceid=US:en",
+        ],
+        "양자컴퓨팅": [
+            "https://news.google.com/rss/search?q=quantum+computing+stock+2026&hl=en-US&gl=US&ceid=US:en",
+        ],
+        "UAM_항공": [
+            "https://news.google.com/rss/search?q=eVTOL+UAM+FAA+certification&hl=en-US&gl=US&ceid=US:en",
+        ],
+        "바이오_유전자": [
+            "https://news.google.com/rss/search?q=CRISPR+gene+therapy+FDA+2026&hl=en-US&gl=US&ceid=US:en",
+        ],
+        "한국_반도체": [
+            "https://news.google.com/rss/search?q=SK하이닉스+HBM+삼성전자+반도체&hl=ko&gl=KR&ceid=KR:ko",
+        ],
+        "한국_방산": [
+            "https://news.google.com/rss/search?q=한화에어로스페이스+한국방산+수주&hl=ko&gl=KR&ceid=KR:ko",
+        ],
+        "글로벌_시장": [
+            "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^DJI,^IXIC&region=US&lang=en-US",
+        ],
+    }
+
+    print("  섹터별 뉴스 수집 중...", flush=True)
+    for sector, urls in sector_feeds.items():
+        sector_news = []
+        for url in urls:
+            if len(sector_news) >= 5:
+                break
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=8)
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.content)
+                    for item in root.findall(".//item")[:5]:
+                        title = item.findtext("title", "").strip()
+                        pubdate = item.findtext("pubDate", "").strip()
+                        if title and title not in sector_news:
+                            sector_news.append(f"[{pubdate[:16]}] {title}")
+            except Exception:
+                pass
+
+        if sector_news:
+            results[f"__sector_{sector}"] = sector_news
+            print(f"    [섹터:{sector}] 뉴스 {len(sector_news)}건", flush=True)
+
     return results
 
 
@@ -792,11 +838,31 @@ def _fmt_pcr(pcr):
 def _fmt_news(news_data: dict) -> str:
     if not news_data:
         return "뉴스 데이터 수집 실패"
+    holding_news = {k: v for k, v in news_data.items() if not k.startswith("__sector_")}
+    sector_news = {k: v for k, v in news_data.items() if k.startswith("__sector_")}
     lines = []
-    for ticker, news_list in news_data.items():
-        lines.append(f"[{ticker}]")
-        for n in news_list:
-            lines.append(f"  - {n}")
+    if holding_news:
+        lines.append("=== 보유 종목 뉴스 ===")
+        for ticker, news_list in holding_news.items():
+            lines.append(f"[{ticker}]")
+            for n in news_list:
+                lines.append(f"  - {n}")
+    if sector_news:
+        lines.append("\n=== 섹터별 시장 동향 (신규 종목 발굴용) ===")
+        sector_labels = {
+            "__sector_AI_반도체": "AI/반도체",
+            "__sector_양자컴퓨팅": "양자컴퓨팅",
+            "__sector_UAM_항공": "UAM/항공우주",
+            "__sector_바이오_유전자": "바이오/유전자",
+            "__sector_한국_반도체": "한국 반도체",
+            "__sector_한국_방산": "한국 방산",
+            "__sector_글로벌_시장": "글로벌 시장",
+        }
+        for key, news_list in sector_news.items():
+            label = sector_labels.get(key, key.replace("__sector_", ""))
+            lines.append(f"[{label}]")
+            for n in news_list:
+                lines.append(f"  - {n}")
     return "\n".join(lines) if lines else "뉴스 없음"
 
 def _fmt_earnings(earnings_data: dict) -> str:
@@ -1869,11 +1935,20 @@ user_content에 [포트폴리오 사전 계산값] 섹션이 제공된다.
   예: "총 회수 935만원 → 총 투입 890만원 → 잔여 현금 +45만원"
 
 [뉴스 데이터 활용 원칙]
-user_content에 [종목별 최신 뉴스]가 제공된다.
+user_content에 [종목별 최신 뉴스]가 제공된다. 두 섹션으로 구분된다:
+
+(1) 보유 종목 뉴스 — 판단 근거로 활용
 - 보유 종목 관련 뉴스는 반드시 판단에 반영하라
 - 긍정 뉴스(실적 호조, 계약, 승인): 판단 한 단계 상향 검토
 - 부정 뉴스(실적 부진, 소송, 리콜): 판단 한 단계 하향 검토
 - 뉴스가 없는 종목은 "(최신 뉴스 없음)"으로 표시
+
+(2) 섹터별 시장 동향 — 신규 종목 발굴용
+- AI/반도체, 양자컴퓨팅, UAM/항공우주, 바이오/유전자, 한국 반도체, 한국 방산, 글로벌 시장 섹터 동향이 제공된다
+- 이 섹터 뉴스를 바탕으로 카테고리3 신규 진입 후보 종목을 발굴하라
+- 강한 모멘텀(거래량 급증, 정책 수혜, 기술 돌파) 섹터에서 1-2개 후보를 제안하라
+- 이미 보유 중인 종목(category1/2/3)은 신규 진입 후보에서 제외하라
+
 - 수집된 뉴스는 실제 데이터이므로 (※AI 학습 데이터 기반) 표시 붙이지 않는다
 
 [실적 데이터 활용 원칙]
@@ -2285,7 +2360,7 @@ def run_daily_report():
     all_tickers = US_TICKERS + KR_TICKERS
 
     print(f"\n[9/11] 뉴스 데이터 수집", flush=True)
-    news_data = get_news_data(all_tickers)
+    news_data = get_news_data(all_tickers, portfolio_data)
 
     print(f"\n[10/11] 실적 데이터 수집", flush=True)
     earnings_data = get_earnings_data(US_TICKERS)
