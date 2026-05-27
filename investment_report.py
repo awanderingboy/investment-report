@@ -343,12 +343,12 @@ def get_news_data(tickers: list, portfolio_data: dict = None) -> dict:
             for it in portfolio_data.get(cat, []):
                 ticker_name_map[it["ticker"]] = it["name"]
 
-    # 미국 주식 뉴스
+    # 미국 주식 뉴스 (Google RSS 1순위, Yahoo RSS 2순위 — Yahoo rate limit 회피)
     for ticker in us_tickers:
         news = []
         urls = [
+            f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en",
             f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
-            f"https://finance.yahoo.com/rss/headline?s={ticker}",
         ]
         for url in urls:
             if news:
@@ -362,6 +362,9 @@ def get_news_data(tickers: list, portfolio_data: dict = None) -> dict:
                         pubdate = item.findtext("pubDate", "").strip()
                         if title:
                             news.append(f"[{pubdate[:16]}] {title}")
+                elif resp.status_code == 429:
+                    import time as _time
+                    _time.sleep(2)
             except Exception:
                 pass
 
