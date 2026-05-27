@@ -1965,24 +1965,67 @@ user_content에 [실행 완료된 매매 내역]이 제공된다.
     # 목표가/손절가 파싱 후 반환
     import re
     targets = {}
-    for line in report.split("\n"):
-        for cat in ["category1", "category2", "category3"]:
-            for it in pf.get(cat, []):
-                ticker = it["ticker"]
-                name = it["name"]
+    for cat in ["category1", "category2", "category3"]:
+        for it in pf.get(cat, []):
+            ticker = it["ticker"]
+            name = it["name"]
+            currency = it["currency"]
+
+            # 해당 종목 관련 줄만 추출
+            relevant_lines = []
+            capture = False
+            for line in report.split("\n"):
                 if name in line or ticker in line:
-                    m = re.search(r"단기\s*\$?([\d,]+)", line)
+                    capture = True
+                if capture:
+                    relevant_lines.append(line)
+                    # 다음 종목 시작 시 중단
+                    if len(relevant_lines) > 20:
+                        break
+
+            for line in relevant_lines:
+                # 목표가 파싱 — 통화에 따라 분리
+                if currency == "KRW":
+                    # 원화: "단기 45,000원" 또는 "단기 45,000"
+                    m = re.search(r"단기\s*([\d,]+)원", line)
+                    if not m:
+                        m = re.search(r"단기\s*([\d,]+)", line)
                     if m:
                         val = float(m.group(1).replace(",", ""))
-                        if ticker not in targets:
-                            targets[ticker] = {}
-                        targets[ticker]["target_price"] = val
-                    m2 = re.search(r"손절[^:]*:\s*\$?([\d,]+)", line)
+                        if val > 1000:  # 원화는 최소 1000원 이상
+                            if ticker not in targets:
+                                targets[ticker] = {}
+                            targets[ticker]["target_price"] = val
+                else:
+                    # 달러: "단기 $235" 또는 "단기 $11.5"
+                    m = re.search(r"단기\s*\$?([\d.]+)", line)
+                    if m:
+                        val = float(m.group(1))
+                        if val > 1:  # 달러는 최소 $1 이상
+                            if ticker not in targets:
+                                targets[ticker] = {}
+                            targets[ticker]["target_price"] = val
+
+                # 손절가 파싱 — 통화에 따라 분리
+                if currency == "KRW":
+                    m2 = re.search(r"손절[^:]*:\s*([\d,]+)원", line)
+                    if not m2:
+                        m2 = re.search(r"손절[^:]*:\s*([\d,]+)", line)
                     if m2:
                         val2 = float(m2.group(1).replace(",", ""))
-                        if ticker not in targets:
-                            targets[ticker] = {}
-                        targets[ticker]["stop_loss"] = val2
+                        if val2 > 1000:
+                            if ticker not in targets:
+                                targets[ticker] = {}
+                            targets[ticker]["stop_loss"] = val2
+                else:
+                    m2 = re.search(r"손절[^:]*:\s*\$?([\d.]+)", line)
+                    if m2:
+                        val2 = float(m2.group(1))
+                        if val2 > 1:
+                            if ticker not in targets:
+                                targets[ticker] = {}
+                            targets[ticker]["stop_loss"] = val2
+
     return report, targets
 
 

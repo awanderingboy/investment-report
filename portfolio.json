@@ -52,7 +52,7 @@
       "shares": 104,
       "avg_price": 36151,
       "currency": "KRW",
-      "target_price": 22.0,
+      "target_price": 45000,
       "stop_loss": 38000
     },
     {
@@ -145,14 +145,14 @@
       "action": "분할매수",
       "ticker": "RGTI",
       "name": "리게티컴퓨팅",
-      "total_units": 20,
-      "done_units": 20,
-      "unit_shares": 1,
+      "total_units": 3,
+      "done_units": 1,
+      "unit_shares": 35,
       "start_shares": 50,
       "unit_amount_usd": 24.5,
-      "memo": "카테고리3 $24~25 분할",
+      "memo": "카테고리3 $24~25 분할 3회 (1회당 35주)",
       "created_date": "2026-05-27",
-      "status": "완료"
+      "status": "진행중"
     }
   ],
   "executed_actions": [
