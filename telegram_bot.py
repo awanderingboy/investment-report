@@ -4,7 +4,8 @@
 import os
 import json
 import logging
-from datetime import date
+import math
+from datetime import date, datetime, timedelta
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -36,6 +37,8 @@ ALIAS: dict[str, str] = {
     "셀트리온": "068270.KS",
     "한미반도체": "042700.KS",
     "마이크로소프트": "MSFT",
+    "리게티": "RGTI", "리게티컴퓨팅": "RGTI",
+    "voo": "VOO",
 }
 
 # 확인 대기 중인 매수 요청: chat_id → pending dict
@@ -75,6 +78,44 @@ def _resolve(name_or_ticker: str, pf: dict) -> tuple:
                 return item["ticker"], item, cat
     return None, None, None
 
+def find_holding(pf: dict, ticker: str) -> tuple:
+    """(cat, item_dict) 또는 (None, None)"""
+    for cat in ("category1", "category2", "category3"):
+        for it in pf.get(cat, []):
+            if it["ticker"].upper() == ticker.upper() or \
+               it["ticker"].split(".")[0].upper() == ticker.upper():
+                return cat, it
+    return None, None
+
+
+# ── 헬퍼 함수 ─────────────────────────────────────────────────────────────────
+
+def calc_new_avg(old_shares: float, old_avg: float, new_shares: float, new_price: float) -> tuple:
+    """평단 재계산 → (new_avg, total_shares)"""
+    total_shares = old_shares + new_shares
+    total_cost = (old_shares * old_avg) + (new_shares * new_price)
+    return round(total_cost / total_shares, 4), total_shares
+
+def add_executed_action(pf: dict, action: str, ticker: str, name: str,
+                        shares: float, price: float, memo: str):
+    """executed_actions에 기록 추가 (90일 롤링)"""
+    if "executed_actions" not in pf:
+        pf["executed_actions"] = []
+    pf["executed_actions"].append({
+        "date": str(date.today()),
+        "action": action,
+        "ticker": ticker,
+        "name": name,
+        "shares": shares,
+        "price_krw": price,
+        "memo": memo
+    })
+    cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+    pf["executed_actions"] = [
+        a for a in pf["executed_actions"]
+        if a.get("date", "") >= cutoff
+    ]
+
 
 # ── 표시 헬퍼 ─────────────────────────────────────────────────────────────────
 
@@ -110,12 +151,19 @@ def _portfolio_text(pf: dict) -> str:
 def _balance_text(pf: dict) -> str:
     cash = pf.get("cash", {})
     cat3_cash = pf.get("category3_cash", 0)
-    return (
-        f"💰 <b>잔고</b>\n"
-        f"원화: {cash.get('krw', 0):,}원\n"
-        f"달러: ${cash.get('usd', 0):,}\n"
-        f"카테고리3 시드: {cat3_cash:,}원"
-    )
+    lines = [
+        f"💰 <b>잔고</b>",
+        f"원화: {cash.get('krw', 0):,}원",
+        f"달러: ${cash.get('usd', 0):,}",
+        f"카테고리3 시드: {cat3_cash:,}원",
+    ]
+    pending = [a for a in pf.get("pending_actions", []) if a.get("status") == "진행중"]
+    if pending:
+        lines.append("\n🔄 <b>진행 중인 분할 계획</b>")
+        for a in pending:
+            remaining = a["total_units"] - a["done_units"]
+            lines.append(f"  {a['name']}: {a['done_units']}/{a['total_units']}회 완료 ({remaining}회 남음)")
+    return "\n".join(lines)
 
 
 # ── 매수 실행 ─────────────────────────────────────────────────────────────────
@@ -146,6 +194,20 @@ async def _execute_buy(update: Update, data: dict):
         pf["cash"]["krw"] = pf["cash"].get("krw", 0) - int(total_cost)
     else:
         pf["cash"]["usd"] = round(pf["cash"].get("usd", 0) - total_cost, 2)
+
+    # pending_actions done_units 자동 업데이트
+    for a in pf.get("pending_actions", []):
+        if a.get("ticker", "").upper() == ticker.upper() and a.get("status") == "진행중":
+            unit_shares = a.get("unit_shares", 0)
+            start_shares = a.get("start_shares", 0)
+            if unit_shares > 0:
+                done = min(int((new_shares - start_shares) / unit_shares), a["total_units"])
+                a["done_units"] = max(done, 0)
+                if a["done_units"] >= a["total_units"]:
+                    a["status"] = "완료"
+
+    # 실행 기록
+    add_executed_action(pf, "매수", ticker, item["name"], shares, price, "텔레그램 매수 명령 실행")
 
     _save(pf)
     await update.message.reply_text(
@@ -189,17 +251,18 @@ async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📌 <b>사용 가능한 명령어</b>\n\n"
             "<b>매수</b> [종목] [수량] [단가]\n"
-            "  예: <code>매수 NVDA 5 220</code>\n"
-            "  예: <code>매수 엔비디아 5 220</code>\n\n"
+            "  예: <code>매수 NVDA 5 220</code>\n\n"
             "<b>매도</b> [종목] [수량] [단가]\n"
             "  예: <code>매도 GOOGL 1 400</code>\n\n"
             "<b>현금</b> [원화|달러] [금액]\n"
-            "  예: <code>현금 원화 15000000</code>\n"
-            "  예: <code>현금 달러 5000</code>\n\n"
-            "<b>잔고</b> — 현재 현금 잔고 조회\n"
+            "  예: <code>현금 원화 15000000</code>\n\n"
+            "<b>잔고</b> — 현금 잔고 + 진행 중인 분할 계획 조회\n"
             "<b>포트폴리오</b> — 전체 보유 현황 조회\n\n"
-            "<b>카테고리3시드</b> [금액] — 카테고리3 시드 설정\n"
-            "  예: <code>카테고리3시드 6000000</code>\n\n"
+            "<b>분할완료</b> [ticker] — 분할 1회 완료 처리\n"
+            "  예: <code>분할완료 NVDA</code>\n\n"
+            "<b>분할추가</b> [ticker] [총회수] [1회당주수] [메모]\n"
+            "  예: <code>분할추가 NVDA 3 1 $210~215 분할</code>\n\n"
+            "<b>카테고리3시드</b> [금액] — 카테고리3 시드 설정\n\n"
             "<b>도움말</b> — 이 메시지 표시",
             parse_mode="HTML",
         )
@@ -347,6 +410,8 @@ async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         currency      = item["currency"]
         total_proceeds = shares * price
+        avg = item["avg_price"]
+        pnl_pct = (price / avg - 1) * 100
         item["shares"] = round(current_shares - shares, 6)
 
         if cat == "category3" and currency == "KRW":
@@ -356,13 +421,101 @@ async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             pf["cash"]["usd"] = round(pf["cash"].get("usd", 0) + total_proceeds, 2)
 
+        # 실행 기록
+        add_executed_action(pf, "매도", ticker, item["name"], shares, price,
+                            f"텔레그램 매도 명령 실행 (수익률 {pnl_pct:+.1f}%)")
+
         _save(pf)
         await update.message.reply_text(
             f"✅ <b>매도 완료</b>\n"
             f"종목: {item['name']}({ticker})\n"
             f"수량: {shares}주 @ {_price_str(price, currency)}\n"
+            f"수익률: {pnl_pct:+.1f}%\n"
             f"수익금: {_price_str(int(total_proceeds) if currency == 'KRW' else total_proceeds, currency)}\n"
             f"잔여 보유: {item['shares']}주",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── 분할완료 ──────────────────────────────────────────────────────────────
+    if cmd == "분할완료":
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "사용법: <code>분할완료 [ticker]</code>\n예: <code>분할완료 NVDA</code>",
+                parse_mode="HTML",
+            )
+            return
+        ticker = parts[1].upper()
+        pf = _load()
+        found = False
+        msg = ""
+        for a in pf.get("pending_actions", []):
+            if a.get("ticker", "").upper() == ticker and a.get("status") == "진행중":
+                a["done_units"] = min(a["done_units"] + 1, a["total_units"])
+                if a["done_units"] >= a["total_units"]:
+                    a["status"] = "완료"
+                    msg = f"✅ {ticker} 분할 계획 완료!\n{a['total_units']}회 전체 완료"
+                else:
+                    remaining = a["total_units"] - a["done_units"]
+                    msg = f"✅ {ticker} 분할 진행\n{a['done_units']}/{a['total_units']}회 완료\n남은 횟수: {remaining}회"
+                found = True
+                break
+        if not found:
+            await update.message.reply_text(f"❌ {ticker} 진행 중인 분할 계획이 없습니다.")
+            return
+        _save(pf)
+        await update.message.reply_text(msg)
+        return
+
+    # ── 분할추가 ──────────────────────────────────────────────────────────────
+    if cmd == "분할추가":
+        if len(parts) < 4:
+            await update.message.reply_text(
+                "사용법: <code>분할추가 [ticker] [총회수] [1회당주수] [메모]</code>\n"
+                "예: <code>분할추가 NVDA 3 1 $210~215 분할</code>",
+                parse_mode="HTML",
+            )
+            return
+        ticker_raw = parts[1].upper()
+        try:
+            total_units = int(parts[2])
+            unit_shares = float(parts[3])
+        except ValueError:
+            await update.message.reply_text("❌ 총회수/1회당주수 형식이 올바르지 않습니다.")
+            return
+        memo = " ".join(parts[4:]) if len(parts) > 4 else ""
+
+        pf = _load()
+        _, item, _ = _resolve(ticker_raw, pf)
+        if item is None:
+            await update.message.reply_text(f"❌ {ticker_raw} 보유 종목에 없습니다.")
+            return
+
+        start_shares = item["shares"]
+        if "pending_actions" not in pf:
+            pf["pending_actions"] = []
+
+        pf["pending_actions"].append({
+            "id": f"{ticker_raw.lower()}_split_{str(date.today()).replace('-', '')}",
+            "action": "분할매수",
+            "ticker": item["ticker"],
+            "name": item["name"],
+            "total_units": total_units,
+            "done_units": 0,
+            "unit_shares": unit_shares,
+            "start_shares": start_shares,
+            "unit_amount_usd": None,
+            "memo": memo,
+            "created_date": str(date.today()),
+            "status": "진행중"
+        })
+
+        _save(pf)
+        await update.message.reply_text(
+            f"✅ 분할 계획 추가\n"
+            f"종목: {item['name']}({item['ticker']})\n"
+            f"계획: {total_units}회 분할 (1회당 {unit_shares}주)\n"
+            f"메모: {memo}",
             parse_mode="HTML",
         )
         return
