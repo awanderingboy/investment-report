@@ -1720,6 +1720,54 @@ user_content의 [전일 추천 검증 데이터]를 반드시 활용해라.
 
 
 # ── 이메일 발송 ───────────────────────────────────────────────────────────────
+def _report_text_to_html(text: str) -> str:
+    """보고서 텍스트를 이메일용 HTML로 변환"""
+    import html as _html
+    lines = text.split('\n')
+    out = []
+    i = 0
+    EMOJI_STARTS = tuple('📊📈📉💼⭐💡🔴🟠🟡🟢💎⚠️✅❌🚫🔄⏸️📅🌍🏛️📋🔍💰')
+
+    while i < len(lines):
+        line = lines[i]
+
+        # 표 블록: | 로 시작하는 연속 줄
+        if line.startswith('|'):
+            table_lines = []
+            while i < len(lines) and lines[i].startswith('|'):
+                table_lines.append(lines[i])
+                i += 1
+            out.append('<table style="border-collapse:collapse;width:100%;margin:8px 0;">')
+            for j, tl in enumerate(table_lines):
+                cells = [c.strip() for c in tl.strip('|').split('|')]
+                # 구분선 행 (--- 포함) 스킵
+                if all(set(c.replace('-','').replace(':','').replace(' ','')) == set() for c in cells):
+                    continue
+                tag = 'th' if j == 0 else 'td'
+                style = ' style="border:1px solid #ddd;padding:6px 10px;background:#1a1a2e;color:white;"' if tag == 'th' else ' style="border:1px solid #ddd;padding:6px 10px;"'
+                out.append('<tr>' + ''.join(f'<{tag}{style}>{_html.escape(c)}</{tag}>' for c in cells) + '</tr>')
+            out.append('</table>')
+            continue
+
+        # 이모지로 시작하는 섹션 제목
+        if line and line[0] in EMOJI_STARTS:
+            out.append(f'<h3 style="color:#1a1a2e;margin:16px 0 6px;border-bottom:1px solid #eee;padding-bottom:4px;">{_html.escape(line)}</h3>')
+            i += 1
+            continue
+
+        # 빈 줄
+        if line.strip() == '':
+            out.append('<br>')
+            i += 1
+            continue
+
+        # 일반 줄
+        out.append(_html.escape(line) + '<br>')
+        i += 1
+
+    return '\n'.join(out)
+
+
 def send_email(report_content):
     today = datetime.now().strftime("%Y년 %m월 %d일")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1753,7 +1801,7 @@ def send_email(report_content):
                 <p>{today}</p>
                 <p class="data-time">데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)</p>
             </div>
-            {report_content}
+            {_report_text_to_html(report_content)}
             <div class="footer">
                 <p>본 보고서는 AI 분석 시스템이 자동 생성한 참고 자료입니다. 투자 결정은 본인의 판단과 책임 하에 이루어져야 합니다.</p>
             </div>
