@@ -1105,6 +1105,32 @@ def save_learning_log(log_entry: dict):
         json.dump(log, f, ensure_ascii=False, indent=2)
     print(f"  learning_log.json 저장 완료 ({len(log)}일치)", flush=True)
 
+def _parse_report_judgments(report: str, all_stock_data: dict) -> dict:
+    """보고서 텍스트에서 종목별 판단 방향 추출 → {ticker: {"방향": "매수"/"매도"/"홀딩", "판단": str}}"""
+    judgments = {}
+    judgment_map = [
+        ("🔴", "매도"), ("🟠", "매도"),
+        ("🟢", "매수"), ("💎", "매수"),
+        ("🟡", "홀딩"),
+    ]
+    judgment_labels = [
+        "🔴 즉시매도", "🟠 비중축소", "🟡 홀딩", "🟢 추가매수", "💎 강력매수",
+        "🔴즉시매도", "🟠비중축소", "🟡홀딩", "🟢추가매수", "💎강력매수",
+    ]
+    for ticker in all_stock_data:
+        for line in report.split('\n'):
+            if ticker not in line:
+                continue
+            for emoji, direction in judgment_map:
+                if emoji in line:
+                    판단_str = next((lbl for lbl in judgment_labels if lbl in line), emoji)
+                    judgments[ticker] = {"방향": direction, "판단": 판단_str}
+                    break
+            if ticker in judgments:
+                break
+    return judgments
+
+
 def build_yesterdays_verification(all_stock_data: dict, exchange_rate: float) -> str:
     log = load_learning_log()
     if not log:
@@ -1131,17 +1157,19 @@ def build_yesterdays_verification(all_stock_data: dict, exchange_rate: float) ->
 
         if rec_price and today_price:
             pct = (float(today_price) / float(rec_price) - 1) * 100
-            is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
-            if is_kr and pct == 0.0:
-                lines.append(f"  {rec.get('name','?')}({ticker}): 추천가 {rec_price} → 오늘 {today_price} (0.0%) ⏸️ 데이터갱신지연 — 정확도 계산 제외")
+            if pct == 0.0:
+                lines.append(f"  {rec.get('name','?')}({ticker}): 추천가 {rec_price} → 오늘 {today_price} (0.0%) ⏸️ 장 미개장 또는 데이터 동일 — 다음 거래일 재확인")
                 continue
             direction = rec.get("방향", "매수")
-            if direction == "매수":
-                correct_flag = "✅정확" if pct > 0 else "❌틀림"
-                correct += 1 if pct > 0 else 0
-            else:
+            if direction == "매도":
                 correct_flag = "✅정확" if pct < 0 else "❌틀림"
                 correct += 1 if pct < 0 else 0
+            elif direction == "홀딩":
+                correct_flag = "✅정확" if abs(pct) <= 2.0 else "❌틀림"
+                correct += 1 if abs(pct) <= 2.0 else 0
+            else:  # 매수
+                correct_flag = "✅정확" if pct > 0 else "❌틀림"
+                correct += 1 if pct > 0 else 0
             total += 1
             lines.append(f"  {rec.get('name','?')}({ticker}): 추천가 {rec_price} → 오늘 {today_price} ({pct:+.1f}%) {correct_flag}")
         else:
@@ -2445,14 +2473,23 @@ def run_daily_report():
             "판단정확도_맞춤": 0,
             "판단정확도_전체": 0,
         }
+        # 보고서에서 종목별 판단 방향 파싱
+        judgments = _parse_report_judgments(report, all_stock_data)
+        # portfolio.json 종목명 맵
+        ticker_name_map = {}
+        for cat in ["category1", "category2", "category3"]:
+            for it in portfolio_data.get(cat, []):
+                ticker_name_map[it["ticker"]] = it["name"]
         for ticker, data in all_stock_data.items():
             price = data.get("현재가")
             if price:
+                j = judgments.get(ticker, {})
                 log_entry["추천종목"].append({
                     "ticker": ticker,
-                    "name": ticker,
+                    "name": ticker_name_map.get(ticker, ticker),
                     "추천가": price,
-                    "방향": "매수"
+                    "방향": j.get("방향", "매수"),
+                    "판단": j.get("판단", ""),
                 })
         save_learning_log(log_entry)
     except Exception as e:
