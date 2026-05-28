@@ -1131,6 +1131,10 @@ def build_yesterdays_verification(all_stock_data: dict, exchange_rate: float) ->
 
         if rec_price and today_price:
             pct = (float(today_price) / float(rec_price) - 1) * 100
+            is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
+            if is_kr and pct == 0.0:
+                lines.append(f"  {rec.get('name','?')}({ticker}): 추천가 {rec_price} → 오늘 {today_price} (0.0%) ⏸️ 데이터갱신지연 — 정확도 계산 제외")
+                continue
             direction = rec.get("방향", "매수")
             if direction == "매수":
                 correct_flag = "✅정확" if pct > 0 else "❌틀림"
