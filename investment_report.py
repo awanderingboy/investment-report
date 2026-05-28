@@ -1065,6 +1065,42 @@ def load_learning_log():
     except Exception:
         return {}
 
+
+def _is_kr_ticker(ticker: str) -> bool:
+    return ticker.endswith(".KS") or ticker.endswith(".KQ")
+
+def _infer_currency(ticker: str) -> str:
+    return "KRW" if _is_kr_ticker(ticker) else "USD"
+
+def _normalize_action(action_str: str) -> str:
+    s = str(action_str).strip()
+    if any(k in s for k in ["강력매수", "추가매수", "분할매수", "신규매수", "매수", "💎", "🟢"]):
+        return "매수"
+    if any(k in s for k in ["즉시매도", "전량매도", "비중축소", "절반매도", "매도", "익절", "손절", "🔴", "🟠"]):
+        return "매도"
+    if any(k in s for k in ["보유", "홀딩", "관망", "추매금지", "매수금지", "알림", "🟡"]):
+        return "홀딩"
+    return "관찰"
+
+def _classify_stock_type(ticker: str, portfolio_data: dict, current_price=None) -> str:
+    HIGH_RISK = {"RGTI", "BEAM", "JOBY", "QBTS", "PWFL"}
+    if any(ticker == it.get("ticker") for it in portfolio_data.get("category1", [])):
+        return "핵심장기보유"
+    if ticker in HIGH_RISK:
+        return "고위험옵션"
+    for it in portfolio_data.get("category2", []):
+        if it.get("ticker") == ticker and current_price:
+            avg = _safe_float(it.get("avg_price"))
+            if avg and (current_price / avg - 1) * 100 <= -10:
+                return "회복탈출관리"
+    return "성장스윙"
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
 def save_learning_log(log_entry: dict):
     log = load_learning_log()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -1074,6 +1110,184 @@ def save_learning_log(log_entry: dict):
     with open(LEARNING_LOG_FILE, "w", encoding="utf-8") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
     print(f"  learning_log.json 저장 완료 ({len(log)}일치)", flush=True)
+
+
+def update_learning_log_returns(pf: dict) -> None:
+    """learning_log.json에서 1일 경과한 추천 항목의 수익률과 성공여부를 업데이트"""
+    log = load_learning_log()
+    if not log:
+        print("  [LEARNING] 로그 없음 — 스킵", flush=True)
+        return
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    changed = False
+    updated = 0
+
+    for date_str, entry in log.items():
+        d_diff = (datetime.strptime(today_str, "%Y-%m-%d") - datetime.strptime(date_str, "%Y-%m-%d")).days
+        if d_diff < 1:
+            continue
+        for rec in entry.get("추천종목", []):
+            if rec.get("1일후수익률") is not None:
+                continue
+            ticker = rec.get("ticker")
+            rec_price = _safe_float(rec.get("당시가격") or rec.get("추천가"))
+            if not ticker or not rec_price:
+                continue
+            try:
+                batch = get_stock_data([ticker])
+                current_price = _safe_float((batch.get(ticker) or {}).get("현재가"))
+            except Exception:
+                current_price = None
+            if not current_price:
+                continue
+            pct = (current_price / rec_price - 1) * 100
+            rec["1일후수익률"] = round(pct, 2)
+            action = _normalize_action(rec.get("추천행동") or rec.get("방향") or "")
+            if pct == 0.0:
+                rec["성공여부"] = None
+            elif action == "매수":
+                rec["성공여부"] = pct > 0
+            elif action == "매도":
+                rec["성공여부"] = pct < 0
+            elif action == "홀딩":
+                rec["성공여부"] = abs(pct) <= 2.0
+            else:
+                rec["성공여부"] = None
+
+            if rec.get("성공여부") is False:
+                tags = []
+                rsi = _safe_float(rec.get("당시RSI"))
+                vol_ratio = _safe_float(rec.get("당시거래량비"))
+                vix = _safe_float(rec.get("당시VIX"))
+                stock_type = rec.get("종목유형", "")
+                market_risk = rec.get("당시시장위험도", "")
+                if rsi is not None:
+                    if action == "매수" and rsi > 70:
+                        tags.append("RSI_false_signal")
+                    elif action == "매도" and rsi < 30:
+                        tags.append("RSI_false_signal")
+                if vol_ratio is not None and vol_ratio < 0.8:
+                    tags.append("weak_volume")
+                if vix is not None and vix > 20 and "높" in market_risk:
+                    tags.append("macro_ignored")
+                if stock_type == "고위험옵션":
+                    tags.append("high_risk_overweight")
+                if _is_kr_ticker(ticker) and action == "매수":
+                    tags.append("korea_momentum_fail")
+                if stock_type == "회복탈출관리" and action == "홀딩":
+                    tags.append("loss_stock_bad_exit")
+                if "높" in market_risk and action == "매수":
+                    tags.append("risk_mode_ignored")
+                if not tags:
+                    tags.append("general_miss")
+                rec["실패태그"] = tags
+            else:
+                rec.setdefault("실패태그", [])
+            changed = True
+            updated += 1
+
+    if changed:
+        cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        log = {k: v for k, v in log.items() if k >= cutoff}
+        with open(LEARNING_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+        print(f"  [LEARNING] 수익률 업데이트 완료 ({updated}건)", flush=True)
+    else:
+        print(f"  [LEARNING] 업데이트 대상 없음", flush=True)
+
+
+def analyze_failure_patterns(days: int = 5) -> dict:
+    """최근 N일간 추천 결과 패턴 분석"""
+    from collections import Counter
+    log = load_learning_log()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    all_recs = []
+    for date_str, entry in log.items():
+        if date_str < cutoff:
+            continue
+        for rec in entry.get("추천종목", []):
+            if rec.get("성공여부") is None:
+                continue
+            all_recs.append(rec)
+
+    if not all_recs:
+        return {}
+
+    total = len(all_recs)
+    successes = sum(1 for r in all_recs if r.get("성공여부") is True)
+    win_rate = successes / total * 100 if total > 0 else 0
+
+    type_stats: dict = {}
+    for rec in all_recs:
+        t = rec.get("종목유형", "기타")
+        type_stats.setdefault(t, {"win": 0, "total": 0})
+        type_stats[t]["total"] += 1
+        if rec.get("성공여부"):
+            type_stats[t]["win"] += 1
+    type_win_rates = {
+        t: round(v["win"] / v["total"] * 100, 1) if v["total"] > 0 else 0
+        for t, v in type_stats.items()
+    }
+
+    fail_tags: Counter = Counter()
+    for rec in all_recs:
+        if rec.get("성공여부") is False:
+            for tag in rec.get("실패태그", []):
+                fail_tags[tag] += 1
+
+    rules = []
+    if win_rate < 50:
+        rules.append("전체 승률 50% 미만 — 오늘 판단 한 단계 보수적 조정")
+    if fail_tags.get("RSI_false_signal", 0) >= 2:
+        rules.append("RSI 극단값 매수/매도 신호 반복 실패 — RSI 70+ 매수 / RSI 30- 매도 주의")
+    if fail_tags.get("weak_volume", 0) >= 2:
+        rules.append("거래량 비율 0.8 미만 반복 — 거래량 미확인 매수 금지")
+    if fail_tags.get("macro_ignored", 0) >= 2:
+        rules.append("VIX 20+ 환경 무시 반복 — 고VIX 시 매수 판단 보수적 조정")
+    if fail_tags.get("high_risk_overweight", 0) >= 2:
+        rules.append("고위험 종목 반복 실패 — 고위험 종목 신규 매수 제한")
+    if fail_tags.get("korea_momentum_fail", 0) >= 2:
+        rules.append("한국 주식 모멘텀 판단 반복 실패 — 한국 시장 매수 조건 강화")
+    if fail_tags.get("risk_mode_ignored", 0) >= 2:
+        rules.append("시장 고위험 무시 반복 — 오늘 매수 판단 전체 보수적 조정")
+    if not rules:
+        rules.append("특이 패턴 없음 — 기존 전략 유지")
+
+    return {
+        "전체승률": round(win_rate, 1),
+        "분석종목수": total,
+        "유형별승률": type_win_rates,
+        "주요실패태그": dict(fail_tags.most_common(5)),
+        "반영규칙": rules,
+    }
+
+
+def _fmt_patterns(p5: dict, p20: dict) -> str:
+    if not p5 and not p20:
+        return "패턴 분석 데이터 없음 (수익률 미집계)"
+    lines = []
+    if p5:
+        lines.append("[최근 5일 패턴]")
+        lines.append(f"  전체승률: {p5.get('전체승률', 'N/A')}% ({p5.get('분석종목수', 0)}건)")
+        for t, r in (p5.get("유형별승률") or {}).items():
+            lines.append(f"  {t}: {r}%")
+        if p5.get("주요실패태그"):
+            lines.append(f"  주요실패: {', '.join(f'{k}({v})' for k, v in p5['주요실패태그'].items())}")
+        lines.append("  반영규칙:")
+        for rule in p5.get("반영규칙", []):
+            lines.append(f"    - {rule}")
+    if p20:
+        lines.append("[최근 20일 패턴]")
+        lines.append(f"  전체승률: {p20.get('전체승률', 'N/A')}% ({p20.get('분석종목수', 0)}건)")
+        for t, r in (p20.get("유형별승률") or {}).items():
+            lines.append(f"  {t}: {r}%")
+        if p20.get("주요실패태그"):
+            lines.append(f"  주요실패: {', '.join(f'{k}({v})' for k, v in p20['주요실패태그'].items())}")
+        lines.append("  반영규칙:")
+        for rule in p20.get("반영규칙", []):
+            lines.append(f"    - {rule}")
+    return "\n".join(lines)
+
 
 def _parse_report_judgments(report: str, all_stock_data: dict) -> dict:
     """보고서 텍스트에서 종목별 판단 방향 추출 → {ticker: {"방향": "매수"/"매도"/"홀딩", "판단": str}}"""
@@ -1341,7 +1555,7 @@ def validate_report(report: str, pf: dict, all_stock_data: dict, exchange_rate: 
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
                     congress_trades, put_call_ratio, portfolio_data=None,
-                    news_data=None, earnings_data=None):
+                    news_data=None, earnings_data=None, patterns_str=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today = datetime.now().strftime("%Y년 %m월 %d일")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1562,6 +1776,17 @@ user_content의 [전일 추천 검증 데이터]를 반드시 활용해라.
 ❌틀림 많으면: 해당 종목/섹터 판단 보수적 조정
 누적 정확도 60% 미만: 오늘 전체 판단 한 단계 보수적 조정
 누적 정확도 80% 이상: 현재 판단 기준 유효 명시
+
+[최근 실패/성공 패턴 활용 원칙]
+user_content의 [최근 실패/성공 패턴 요약]을 반드시 확인하고 반영규칙을 준수해라.
+- 전체 승률 50% 미만이면: 오늘 전체 판단 한 단계 보수적으로 조정 (매수→홀딩, 홀딩→관망)
+- RSI_false_signal 2회 이상이면: RSI 70+ 종목 매수 추천 금지, RSI 30- 종목 매도 추천 자제
+- weak_volume 2회 이상이면: 거래량비율 0.8 미만 종목 신규 매수 금지
+- macro_ignored 2회 이상이면: VIX 20+ 환경에서 매수 추천 전면 제한
+- high_risk_overweight 2회 이상이면: RGTI/BEAM/JOBY/QBTS/PWFL 신규 매수 금지
+- korea_momentum_fail 2회 이상이면: 한국 주식 추가 매수 조건 강화 (RSI 40 이하 + 거래량 1.5배 이상)
+- risk_mode_ignored 2회 이상이면: 오늘 매수 추천 전체 보수적 조정
+패턴 데이터 없음이면: 기존 전략 유지
 
 [WTI/Gold 수집 실패]
 "⚠️ WTI 범위 이탈(X달러)" 또는 "⚠️ WTI API 수집 오류"로 원인 구분해라.
@@ -1953,6 +2178,7 @@ RGTI, BEAM, JOBY 같은 미국 고위험 종목은 매도 조건을 현재가보
         f"[종목별 최신 뉴스]\n{_fmt_news(news_data)}\n\n"
         f"[종목별 실적 데이터]\n{_fmt_earnings(earnings_data)}\n\n"
         f"[전일 추천 검증 데이터 — 자기학습용]\n{yesterdays_verification}\n\n"
+        f"[최근 실패/성공 패턴 요약 — 반영규칙 준수]\n{patterns_str or '패턴 데이터 없음'}\n\n"
         f"[실행 완료된 매매 내역]\n{executed_summary}\n\n"
         f"오늘 날짜: {today}\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
@@ -2368,11 +2594,27 @@ def run_daily_report():
     print(f"\n[10/11] 실적 데이터 수집", flush=True)
     earnings_data = get_earnings_data(US_TICKERS)
 
+    print(f"\n[LEARNING] 수익률/성공여부 업데이트", flush=True)
+    try:
+        update_learning_log_returns(portfolio_data)
+    except Exception as e:
+        print(f"  [LEARNING] 수익률 업데이트 실패: {e}", flush=True)
+
+    print(f"\n[LEARNING] 실패/성공 패턴 분석", flush=True)
+    try:
+        p5  = analyze_failure_patterns(days=5)
+        p20 = analyze_failure_patterns(days=20)
+        patterns_str = _fmt_patterns(p5, p20)
+        print(f"  [LEARNING] 5일 승률: {p5.get('전체승률','N/A')}% / 20일 승률: {p20.get('전체승률','N/A')}%", flush=True)
+    except Exception as e:
+        print(f"  [LEARNING] 패턴 분석 실패: {e}", flush=True)
+        patterns_str = "패턴 분석 실패"
+
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
                                       macro_data, fear_greed, insider_trades,
                                       congress_trades, put_call_ratio, portfolio_data,
-                                      news_data, earnings_data)
+                                      news_data, earnings_data, patterns_str)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
 
     # 목표가/손절가 portfolio.json에 자동 저장
@@ -2415,6 +2657,17 @@ def run_daily_report():
     # learning_log 저장
     try:
         all_stock_data = {**us_data, **kr_data}
+        # VIX 값 및 시장위험도 계산
+        _vix_val = _safe_float((macro_data.get("VIX") or {}).get("value"))
+        if _vix_val is None:
+            _market_risk = "불명"
+        elif _vix_val < 15:
+            _market_risk = "낮음"
+        elif _vix_val <= 20:
+            _market_risk = "보통"
+        else:
+            _market_risk = "높음"
+
         log_entry = {
             "추천종목": [],
             "즉시매도": [],
@@ -2422,24 +2675,46 @@ def run_daily_report():
             "판단정확도_맞춤": 0,
             "판단정확도_전체": 0,
         }
-        # 보고서에서 종목별 판단 방향 파싱
         judgments = _parse_report_judgments(report, all_stock_data)
-        # portfolio.json 종목명 맵
         ticker_name_map = {}
         for cat in ["category1", "category2"]:
             for it in portfolio_data.get(cat, []):
-                ticker_name_map[it["ticker"]] = it["name"]
+                ticker_name_map[it["ticker"]] = it.get("name", it["ticker"])
+
+        existing_tickers = {rec["ticker"] for rec in log_entry["추천종목"]}
         for ticker, data in all_stock_data.items():
-            price = data.get("현재가")
-            if price:
-                j = judgments.get(ticker, {})
-                log_entry["추천종목"].append({
-                    "ticker": ticker,
-                    "name": ticker_name_map.get(ticker, ticker),
-                    "추천가": price,
-                    "방향": j.get("방향", "매수"),
-                    "판단": j.get("판단", ""),
-                })
+            if ticker in existing_tickers:
+                continue
+            price = _safe_float(data.get("현재가"))
+            if not price:
+                continue
+            j = judgments.get(ticker, {})
+            raw_action = j.get("판단", "")
+            norm_action = _normalize_action(raw_action or j.get("방향", ""))
+            stock_type = _classify_stock_type(ticker, portfolio_data, price)
+            log_entry["추천종목"].append({
+                "ticker": ticker,
+                "name": ticker_name_map.get(ticker, ticker),
+                "추천가": price,
+                "방향": j.get("방향", norm_action),
+                "판단": raw_action,
+                "추천행동": norm_action,
+                "원문추천행동": raw_action,
+                "종목유형": stock_type,
+                "당시가격": price,
+                "당시RSI": _safe_float(data.get("RSI14")),
+                "당시MA상태": "정배열" if data.get("정배열") else "역배열",
+                "당시거래량비": _safe_float(data.get("거래량비율(5일/20일)")),
+                "당시VIX": _vix_val,
+                "당시시장위험도": _market_risk,
+                "당시섹터": "",
+                "1일후수익률": None,
+                "5일후수익률": None,
+                "20일후수익률": None,
+                "성공여부": None,
+                "실패태그": [],
+                "반영규칙": "",
+            })
         save_learning_log(log_entry)
     except Exception as e:
         print(f"  learning_log 저장 실패: {e}", flush=True)
