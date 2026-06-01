@@ -1101,6 +1101,16 @@ def _safe_float(v):
     except (TypeError, ValueError):
         return None
 
+def _get_portfolio_tickers(portfolio):
+    """portfolio category1/category2에서 실제 보유 종목 ticker set을 반환한다."""
+    owned = set()
+    for cat in ["category1", "category2"]:
+        for it in portfolio.get(cat, []):
+            t = it.get("ticker")
+            if t:
+                owned.add(t)
+    return owned
+
 def save_learning_log(log_entry: dict):
     log = load_learning_log()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -1603,6 +1613,7 @@ def build_trade_decision_engine(
             pf_items[it["ticker"]] = it
     pf_tickers = {t: it.get("name", t) for t, it in pf_items.items()}
     all_tickers_ordered = list(dict.fromkeys(list(pf_tickers.keys()) + list(all_data.keys())))
+    _pf_owned_tickers = _get_portfolio_tickers(portfolio)
 
     _cat_map = {
         "핵심장기보유": "유형①",
@@ -1897,9 +1908,96 @@ def build_trade_decision_engine(
                 "cash_impact":        "",
             },
             "failure_conditions": failure_conditions,
+            "portfolio_owned":    ticker in _pf_owned_tickers,
         })
 
     return results
+
+
+# ── TDE/LLM 충돌 감지 ────────────────────────────────────────────────────────
+def detect_tde_llm_conflicts(report, tde_results):
+    """
+    LLM 본문과 TDE 결과가 충돌하는지 탐지한다.
+    긍정형 매수/추매 표현만 감지하고 금지 표현은 false positive 방지한다.
+    충돌 목록을 반환한다.
+    """
+    import re as _re
+    conflicts = []
+    if not tde_results or not isinstance(report, str):
+        return conflicts
+
+    ab_count = sum(
+        1 for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+    )
+
+    # 1. 신규 매수 가능 표현 충돌 (A/B 0개인데 매수 가능성 암시)
+    if ab_count == 0:
+        _buy_pos = [
+            r"신규\s*매수\s*가능\s*여부\s*[:：]\s*(?!불가|금지|없음)",
+            r"신규\s*진입\s*\d+%\s*축소",
+            r"제한적\s*매수(?!\s*금지|\s*불가)",
+            r"신규\s*매수\s*(?:가능|허용|검토)(?!\s*금지|\s*불가)",
+        ]
+        for _pat in _buy_pos:
+            if _re.search(_pat, report):
+                conflicts.append({
+                    "type": "신규 매수 표현 충돌",
+                    "detail": (
+                        "LLM 본문에 신규 매수 가능/제한적 표현이 있지만 "
+                        "TDE 기준 신규 목돈 매수 A/B 후보 0개입니다. "
+                        "'신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로 표현해야 합니다."
+                    ),
+                })
+                break
+
+    # 2. 고위험 추매 충돌
+    _HIGH_RISK = {"RGTI", "BEAM", "JOBY", "PWFL"}
+    _hr_d = {
+        t["symbol"] for t in tde_results
+        if t["symbol"] in _HIGH_RISK
+        and (t["trade_eligibility"]["buy_grade"] == "D" or t["category"] == "유형③")
+    }
+    for _sym in _hr_d:
+        _pat = rf"{_sym}[^\n]{{0,30}}(?:추매(?!\s*금지|\s*불가)|추가\s*매수(?!\s*금지|\s*불가)|매수\s*후보(?!\s*없음))"
+        if _re.search(_pat, report):
+            conflicts.append({
+                "type": "고위험 추매 충돌",
+                "detail": f"{_sym}는 TDE D등급(유형③ 고위험)인데 본문에 추매/추가매수 가능 표현이 있습니다.",
+            })
+
+    # 3. 셀트리온제약 물타기 충돌
+    _celltrion_d = any(
+        t["symbol"] == "068760.KS" and t["category"] == "유형④"
+        for t in tde_results
+    )
+    if _celltrion_d:
+        for _cn in ["셀트리온제약", "셀트리온 제약", "068760"]:
+            _pat = rf"{_cn}[^\n]{{0,20}}(?:추매|물타기|추가\s*매수)(?!\s*금지|\s*불가)"
+            if _re.search(_pat, report):
+                conflicts.append({
+                    "type": "셀트리온제약 물타기 충돌",
+                    "detail": "셀트리온제약은 TDE 유형④(회복탈출관리)인데 본문에 추매/물타기 가능 표현이 있습니다.",
+                })
+                break
+
+    # 4. A/B 0개인데 오늘 주문 실행 가능 표현
+    if ab_count == 0:
+        for _pat in [r"오늘\s*실제\s*주문", r"신규\s*매수\s*실행", r"매수\s*실행"]:
+            _m = _re.search(_pat, report)
+            if _m:
+                _ctx = report[max(0, _m.start() - 5): _m.end() + 20]
+                if not _re.search(r"없음|금지|불가", _ctx):
+                    conflicts.append({
+                        "type": "주문 실행 표현 충돌",
+                        "detail": (
+                            "TDE 신규 목돈 매수 A/B 후보 0개인데 본문에 "
+                            "오늘 주문/매수 실행 가능 표현이 있습니다."
+                        ),
+                    })
+                    break
+
+    return conflicts
 
 
 # ── TDE 보고서 섹션 렌더러 ─────────────────────────────────────────────────────
@@ -1997,8 +2095,15 @@ def render_tde_report_section(tde_results):
         lines += ["자동 적립 유지 가능 종목 없음", ""]
 
     # ── 4. 오늘 금지 행동 ────────────────────────────────────────────────────
+    # portfolio_owned=True이고 auto_dca_allowed=False인 종목만 표시
+    # DCA 종목(VOO/GOOGL/FCX)은 자동 적립 유지표에서 이미 표시하므로 중복 제거
     lines += ["오늘 금지 행동", ""]
-    d_items = [t for t in tde_results if t["trade_eligibility"]["buy_grade"] == "D"]
+    d_items = [
+        t for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] == "D"
+        and t.get("portfolio_owned", True)
+        and not t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]
+    ]
     if d_items:
         lines += [
             "| 종목 | 금지 행동 | 이유 |",
@@ -3398,7 +3503,7 @@ PLTR은 RGTI와 같은 "손실 제한 감시" 종목이 아니다. PLTR은 유�
 7. 고위험 옵션성 비중 10% 이하
 8. 셀트리온제약 단일 비중 25% 이하
 9. 신규 후보 중 기대수익/손실비 2:1 이상 종목 1개 이상
-10. 실시간 가격/뉴스/차트/거래량 검증 통과 종목 1개 이상
+10. TDE 신규 목돈 매수 A/B 후보 1개 이상 (실시간 가격/뉴스/차트/거래량 검증 통과 기준)
 
 판단:
 - 조건 8개 이상 충족: 신규 매수 모드 부분 허용, A등급 후보 가능
@@ -3463,6 +3568,7 @@ PLTR은 RGTI와 같은 "손실 제한 감시" 종목이 아니다. PLTR은 유�
 
 [TDE 실전 매매 판단 엔진 우선 원칙]
 TDE 실전 매매 판단 엔진 섹션은 코드가 계산한 결과이므로, LLM 본문 판단보다 우선한다. LLM은 TDE의 buy_grade, 자동 적립 가능 여부, 신규 목돈 매수 금지 판단을 임의로 상향하거나 덮어쓰지 않는다.
+TDE 기준 신규 목돈 매수 A/B 후보가 0개일 경우, 본문에서 '신규 매수 가능', '제한적 매수', '신규 진입 30% 축소'처럼 실행 가능성을 암시하는 표현을 쓰지 않는다. 이 경우 '신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로 표현한다.
 """
 
     static_system = (
@@ -4070,7 +4176,25 @@ def run_daily_report():
     # TDE 섹션을 보고서 하단에 추가 (코드가 직접 생성 — LLM 본문 훼손 없음)
     try:
         if isinstance(report, str):
-            tde_section = render_tde_report_section(tde_results if tde_results else [])
+            _tde_list   = tde_results if tde_results else []
+            tde_section = render_tde_report_section(_tde_list)
+            # LLM/TDE 충돌 감지
+            _conflicts = detect_tde_llm_conflicts(report, _tde_list)
+            if _conflicts:
+                _conf_lines = [
+                    "", "### ⚠️ TDE/LLM 충돌 검증", "",
+                    "| 충돌 항목 | 내용 |", "| --- | --- |",
+                ]
+                for _c in _conflicts:
+                    _conf_lines.append(f"| {_c['type']} | {_c['detail']} |")
+                tde_section = tde_section + "\n" + "\n".join(_conf_lines)
+                print(f"  [TDE][CONFLICT] 충돌 {len(_conflicts)}건 감지", flush=True)
+            else:
+                tde_section = (
+                    tde_section
+                    + "\n\n### ⚠️ TDE/LLM 충돌 검증\n\n"
+                    + "충돌 없음 — TDE와 LLM 본문 판단이 일치합니다."
+                )
             report = report + "\n\n" + tde_section
             print(f"  [TDE] 보고서 하단에 TDE 섹션 추가 완료 ({len(tde_section)}자)", flush=True)
         else:
