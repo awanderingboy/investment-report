@@ -1551,6 +1551,33 @@ def validate_report(report: str, pf: dict, all_stock_data: dict, exchange_rate: 
     return errors
 
 
+# ── TDE helpers ───────────────────────────────────────────────────────────────
+def _get_metric(summary, keys, default=None):
+    """learning_summary에서 다양한 키 이름으로 값을 탐색한다."""
+    if not summary:
+        return default
+    for k in keys:
+        if k in summary:
+            return summary[k]
+    return default
+
+
+def _normalize_pct(v):
+    """0.306 → 30.6 / 30.6 → 30.6 / '30.6%' → 30.6 / None → None"""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip().rstrip("%")
+        try:
+            v = float(v)
+        except ValueError:
+            return None
+    v = float(v)
+    if 0 < abs(v) < 2.0:   # 0.306처럼 소수 비율이면 ×100
+        return v * 100
+    return v
+
+
 # ── TDE (Trade Decision Engine) ───────────────────────────────────────────────
 def build_trade_decision_engine(
     us_data,
@@ -1559,19 +1586,22 @@ def build_trade_decision_engine(
     learning_summary,
     macro_data,
     news_data=None,
-    earnings_data=None
+    earnings_data=None,
+    exchange_rate=None,   # 2단계에서 추가 — 포트폴리오 비중 계산에 사용
 ):
     """
     종목별 trade_decision JSON을 생성한다.
-    1단계: 데이터 구조 뼈대만 만든다. buy_grade 완성 계산은 2단계에서 한다.
+    2단계: buy_grade A/B/C/D 계산 로직 추가.
     """
     all_data = {**us_data, **kr_data}
+    _exr = _safe_float(exchange_rate) or 1400.0   # 환율 fallback
 
-    # 포트폴리오 전체 종목 목록 (데이터 수집 실패 종목 포함)
-    pf_tickers = {}
+    # ── 포트폴리오 종목 목록 ────────────────────────────────────────────────
+    pf_items = {}
     for cat in ["category1", "category2"]:
         for it in portfolio.get(cat, []):
-            pf_tickers[it["ticker"]] = it.get("name", it["ticker"])
+            pf_items[it["ticker"]] = it
+    pf_tickers = {t: it.get("name", t) for t, it in pf_items.items()}
     all_tickers_ordered = list(dict.fromkeys(list(pf_tickers.keys()) + list(all_data.keys())))
 
     _cat_map = {
@@ -1581,6 +1611,56 @@ def build_trade_decision_engine(
         "성장스윙":     "유형②",
     }
 
+    HIGH_RISK_TICKERS = {"RGTI", "BEAM", "JOBY", "PWFL", "QBTS"}
+    DCA_TICKERS       = {"VOO", "GOOGL", "FCX"}
+    CELLTRION_TICKER  = "068760.KS"
+
+    # ── learning_summary 지표 추출 ──────────────────────────────────────────
+    win_rate_5d  = _normalize_pct(_get_metric(
+        learning_summary, ["전체승률", "win_rate_5d", "recent_5d_win_rate", "5일 승률"]))
+    win_rate_20d = _normalize_pct(_get_metric(
+        learning_summary, ["win_rate_20d", "20일 승률"]))
+    prev_accuracy = _normalize_pct(_get_metric(
+        learning_summary, ["previous_accuracy", "accuracy_1d", "전일정확도"]))
+
+    # ── 포트폴리오 리스크 계산 ──────────────────────────────────────────────
+    total_usd_est   = 0.0
+    ticker_val_usd  = {}
+    for t, d in all_data.items():
+        price = _safe_float(d.get("현재가"))
+        if price is None:
+            continue
+        it = pf_items.get(t, {})
+        shares   = _safe_float(it.get("shares")) or 0.0
+        currency = it.get("currency", "USD")
+        val = price * shares / _exr if currency == "KRW" else price * shares
+        ticker_val_usd[t] = val
+        total_usd_est += val
+
+    def _weight_pct(tickers_set):
+        if total_usd_est <= 0:
+            return None
+        return sum(ticker_val_usd.get(t, 0.0) for t in tickers_set) / total_usd_est * 100
+
+    high_risk_weight_pct  = _weight_pct(HIGH_RISK_TICKERS)
+    celltrion_weight_pct  = _weight_pct({CELLTRION_TICKER})
+
+    # ── 전역 강제 D 조건 ────────────────────────────────────────────────────
+    win_rate_too_low  = win_rate_5d is not None and win_rate_5d < 30.0
+    high_risk_exceeded = high_risk_weight_pct is not None and high_risk_weight_pct > 10.0
+
+    # ── 임시 목표가/손절가 ──────────────────────────────────────────────────
+    # TODO: 3단계 이후 price_targets.json 또는 portfolio.json의 전략 필드에서 stop/target을 읽도록 이전
+    PRICE_TARGETS = {
+        "VOO":       {"stop": None,      "target": 720.0},
+        "GOOGL":     {"stop": 370.0,     "target": 410.0},
+        "FCX":       {"stop": 60.0,      "target": 70.0},
+        "NVDA":      {"stop": 200.0,     "target": 230.0},
+        "RGTI":      {"stop": 22.0,      "target": 28.0},
+        "BEAM":      {"stop": 28.0,      "target": 35.0},
+        "042700.KS": {"stop": 280000.0,  "target": 360000.0},   # 한미반도체
+    }
+
     def _not_na(v):
         if v is None or v == "N/A":
             return False
@@ -1588,15 +1668,14 @@ def build_trade_decision_engine(
 
     results = []
     for ticker in all_tickers_ordered:
-        data = all_data.get(ticker, {})
+        data          = all_data.get(ticker, {})
         current_price = _safe_float(data.get("현재가"))
-        name = pf_tickers.get(ticker, ticker)
+        name          = pf_tickers.get(ticker, ticker)
 
-        # 종목 유형 분류
         raw_type = _classify_stock_type(ticker, portfolio, current_price)
         category = _cat_map.get(raw_type, "유형②")
 
-        # ── data_status ───────────────────────────────────────────
+        # ── data_status ─────────────────────────────────────────────────────
         price_collected = current_price is not None
         volume_collected = _safe_float(data.get("거래량비율(5일/20일)")) is not None
         technical_collected = (
@@ -1605,18 +1684,16 @@ def build_trade_decision_engine(
             or _safe_float(data.get("MACD")) is not None
         )
         fundamental_collected = (
-            _not_na(data.get("PER"))
-            or _not_na(data.get("PBR"))
-            or _not_na(data.get("영업이익률"))
+            _not_na(data.get("PER")) or _not_na(data.get("PBR")) or _not_na(data.get("영업이익률"))
         )
         news_collected = bool(news_data and news_data.get(ticker))
 
         data_issues = []
-        if not price_collected:      data_issues.append("price_missing")
-        if not volume_collected:     data_issues.append("volume_missing")
-        if not technical_collected:  data_issues.append("technical_missing")
+        if not price_collected:       data_issues.append("price_missing")
+        if not volume_collected:      data_issues.append("volume_missing")
+        if not technical_collected:   data_issues.append("technical_missing")
         if not fundamental_collected: data_issues.append("fundamental_missing")
-        if not news_collected:       data_issues.append("news_missing")
+        if not news_collected:        data_issues.append("news_missing")
 
         if not price_collected:
             data_quality = "D"
@@ -1627,19 +1704,157 @@ def build_trade_decision_engine(
         else:
             data_quality = "C"
 
-        # ── trade_eligibility ─────────────────────────────────────
+        # ── RSI 추출 및 유형별 lump_sum 차단 판정 ────────────────────────────
+        rsi = _safe_float(data.get("RSI14"))
+
+        if category in ("유형③", "유형④"):
+            rsi_blocks_lump = True
+        elif ticker == "FCX":                           # 유형① 원자재
+            rsi_blocks_lump = rsi is not None and rsi > 68
+        elif category == "유형①":                       # VOO, GOOGL
+            rsi_blocks_lump = rsi is not None and rsi > 65
+        else:                                           # 유형②
+            rsi_blocks_lump = rsi is not None and rsi > 65
+
+        # ── 자동 적립 vs 신규 목돈 매수 분리 ────────────────────────────────
+        auto_dca_allowed = ticker in DCA_TICKERS
+        auto_dca_reason  = (
+            "기존 자동 적립 유지 (승률 무관)" if auto_dca_allowed else "자동 적립 대상 아님"
+        )
+
+        # ── risk_reward 계산 ─────────────────────────────────────────────────
+        pt       = PRICE_TARGETS.get(ticker, {})
+        stop_p   = _safe_float(pt.get("stop"))
+        target_p = _safe_float(pt.get("target"))
+        entry_p  = current_price
+
+        rr_valid = False
+        gain_pct = loss_pct = rr_ratio = None
+
+        if entry_p and target_p and target_p > entry_p:
+            gain_pct = (target_p - entry_p) / entry_p * 100
+            if stop_p and stop_p < entry_p:
+                loss_pct = (stop_p - entry_p) / entry_p * 100
+                if abs(loss_pct) > 0:
+                    rr_ratio  = gain_pct / abs(loss_pct)
+                    rr_valid  = True
+
+        if ticker == "VOO":
+            rr_valid = False   # 장기 적립 — 명확한 손절가 없음
+
+        # ── buy_grade A/B/C/D 계산 ──────────────────────────────────────────
+        reason            = []
+        buy_grade         = "D"
+        lump_sum_allowed  = False
+
+        if not price_collected:
+            reason    += ["현재가 수집 실패 — 판단 불가", "data_quality D"]
+            buy_grade  = "D"
+
+        elif data_quality == "D":
+            reason    += ["데이터 품질 D — 판단 불가", "주요 지표 미수집"]
+            buy_grade  = "D"
+
+        elif category == "유형④":
+            reason    += [f"유형④ 회복/탈출 관리 — 신규 매수 대상 아님",
+                          f"{name} 손절/회복 기준만 관리"]
+            buy_grade  = "D"
+
+        elif category == "유형③":
+            reason    += ["유형③ 고위험 옵션성 — 신규 매수 금지 원칙"]
+            if high_risk_exceeded:
+                reason.append(f"고위험 합산 비중 {high_risk_weight_pct:.1f}% > 10% 초과")
+            else:
+                reason.append("정책 모멘텀은 보유 근거이나 추매 근거 아님")
+            buy_grade  = "D"
+
+        elif win_rate_too_low:
+            reason    += [f"최근 5일 승률 {win_rate_5d:.1f}% < 30% — 신규 목돈 매수 D"]
+            if ticker in DCA_TICKERS:
+                reason.append(f"유형① 자동 적립({ticker})은 계속 진행 가능")
+            else:
+                reason.append("승률 회복 시 재평가")
+            buy_grade  = "D"
+
+        else:
+            # ── A 조건 평가 ─────────────────────────────────────────────────
+            a_ok = (
+                data_quality in ("A", "B")
+                and (win_rate_5d is not None and win_rate_5d >= 40.0)
+                and (
+                    (prev_accuracy is not None and prev_accuracy >= 70.0)
+                    or (win_rate_20d is not None and win_rate_20d >= 45.0)
+                )
+                and (not high_risk_exceeded or category == "유형①")
+                and (celltrion_weight_pct is None or celltrion_weight_pct <= 25.0)
+                and rr_valid
+                and (rr_ratio is not None and rr_ratio >= 2.0)
+                and (gain_pct is not None and gain_pct >= 8.0)
+                and (loss_pct is not None and abs(loss_pct) <= 7.0)
+                and not rsi_blocks_lump
+                and category != "유형③"
+            )
+
+            # ── B 조건 평가 ─────────────────────────────────────────────────
+            b_ok = (
+                data_quality in ("A", "B")
+                and (
+                    (win_rate_5d is not None and win_rate_5d >= 35.0)
+                    or category == "유형①"
+                )
+                and rr_valid
+                and (rr_ratio is not None and rr_ratio >= 1.5)
+                and (loss_pct is not None and abs(loss_pct) <= 10.0)
+                and (not high_risk_exceeded or category == "유형①")
+                and category != "유형③"
+                and not rsi_blocks_lump
+            )
+
+            if a_ok:
+                buy_grade        = "A"
+                lump_sum_allowed = True
+                rsi_str          = f"{rsi:.1f}" if rsi is not None else "N/A"
+                reason          += [
+                    f"A등급 — RR {rr_ratio:.2f} / 5일승률 {win_rate_5d:.1f}%",
+                    f"RSI {rsi_str} 허용 범위 내 / 고위험 비중 정상",
+                ]
+            elif b_ok:
+                buy_grade        = "B"
+                lump_sum_allowed = True
+                rsi_str          = f"{rsi:.1f}" if rsi is not None else "N/A"
+                reason          += [
+                    f"B등급 — RR {rr_ratio:.2f} / 소액 분할 매수 검토",
+                    f"RSI {rsi_str} / 5일승률 {win_rate_5d:.1f}% 조건 충족",
+                ]
+            else:
+                buy_grade = "C"
+                if rsi_blocks_lump:
+                    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+                    reason.append(f"RSI {rsi_str} 과열 — 신규 목돈 매수 제한")
+                if not rr_valid:
+                    reason.append("RR 미계산 (valid=false) — A/B 불가")
+                elif rr_ratio is not None and rr_ratio < 1.5:
+                    reason.append(f"RR {rr_ratio:.2f} < 1.5 — B등급 기준 미달")
+                if win_rate_5d is not None and win_rate_5d < 40.0:
+                    reason.append(f"5일 승률 {win_rate_5d:.1f}% < 40% — A등급 기준 미달")
+                if not reason:
+                    reason += ["조건 미달 — C등급 관찰", "조건 충족 시 B 상향 가능"]
+
+        # reason 최소 2개 보장
+        if len(reason) < 2:
+            reason.append(f"buy_grade={buy_grade} 확정")
+
+        buy_allowed  = lump_sum_allowed and buy_grade in ("A", "B")
         hold_grade   = "A" if data_quality in ("A", "B", "C") else "D"
         hold_allowed = price_collected and data_quality in ("A", "B", "C")
-        buy_allowed  = False   # 1단계: PENDING 고정
-        sell_allowed = False   # 1단계: PENDING 고정
 
         failure_conditions = []
         if not price_collected:
             failure_conditions.append("price_missing")
 
         results.append({
-            "symbol": ticker,
-            "name": name,
+            "symbol":   ticker,
+            "name":     name,
             "category": category,
             "data_status": {
                 "price_collected":       price_collected,
@@ -1651,29 +1866,35 @@ def build_trade_decision_engine(
                 "data_issues":           data_issues,
             },
             "trade_eligibility": {
-                "buy_grade":   "PENDING",
-                "sell_grade":  "PENDING",
-                "hold_grade":  hold_grade,
-                "buy_allowed": buy_allowed,
-                "sell_allowed": sell_allowed,
+                "buy_grade":    buy_grade,
+                "sell_grade":   "PENDING",   # 3단계에서 구현
+                "hold_grade":   hold_grade,
+                "buy_allowed":  buy_allowed,
+                "sell_allowed": False,        # 3단계에서 구현
                 "hold_allowed": hold_allowed,
-                "reason": ["buy_grade 계산은 2단계에서 완성"],
+                "buy_type": {
+                    "auto_dca_allowed":     auto_dca_allowed,
+                    "lump_sum_buy_allowed": lump_sum_allowed,
+                    "auto_dca_reason":      auto_dca_reason,
+                    "lump_sum_reason":      "; ".join(reason[:2]) if reason else "",
+                },
+                "reason": reason,
             },
             "risk_reward": {
-                "entry_price":       None,
-                "stop_price":        None,
-                "target_price":      None,
-                "expected_gain_pct": None,
-                "expected_loss_pct": None,
-                "reward_risk_ratio": None,
-                "valid":             False,
+                "entry_price":       entry_p,
+                "stop_price":        stop_p,
+                "target_price":      target_p,
+                "expected_gain_pct": round(gain_pct, 2) if gain_pct is not None else None,
+                "expected_loss_pct": round(loss_pct, 2) if loss_pct is not None else None,
+                "reward_risk_ratio": round(rr_ratio, 2) if rr_ratio is not None else None,
+                "valid":             rr_valid,
             },
             "position_action": {
-                "today_action":      "",
+                "today_action":       "",
                 "conditional_action": "",
-                "forbidden_action":  "",
-                "position_size":     "",
-                "cash_impact":       "",
+                "forbidden_action":   "",
+                "position_size":      "",
+                "cash_impact":        "",
             },
             "failure_conditions": failure_conditions,
         })
@@ -3553,9 +3774,13 @@ def run_daily_report():
         print(f"  [LEARNING] 패턴 분석 실패: {e}", flush=True)
         patterns_str = "패턴 분석 실패"
 
-    # TDE Stage 1: 데이터 구조 뼈대 생성 및 로그 출력
+    # TDE Stage 2: buy_grade 계산 포함
     try:
-        _learning_summary = p5 if isinstance(locals().get("p5"), dict) else {}
+        _p5  = p5  if isinstance(locals().get("p5"),  dict) else {}
+        _p20 = p20 if isinstance(locals().get("p20"), dict) else {}
+        _learning_summary = {**_p5}
+        if _p20:
+            _learning_summary["win_rate_20d"] = _p20.get("전체승률")
         tde_results = build_trade_decision_engine(
             us_data=us_data,
             kr_data=kr_data,
@@ -3564,12 +3789,27 @@ def run_daily_report():
             macro_data=macro_data,
             news_data=news_data,
             earnings_data=earnings_data if "earnings_data" in dir() else None,
+            exchange_rate=exchange_rate,
         )
-        _tde_total  = len(tde_results)
-        _tde_passed = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
+        _tde_total   = len(tde_results)
+        _tde_passed  = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
         _tde_missing = [t["symbol"] for t in tde_results if not t["data_status"]["price_collected"]]
+        _grade_cnt   = {"A": 0, "B": 0, "C": 0, "D": 0, "PENDING": 0}
+        _dca_syms, _ab_syms, _d_syms = [], [], []
+        for _t in tde_results:
+            _g = _t["trade_eligibility"]["buy_grade"]
+            _grade_cnt[_g] = _grade_cnt.get(_g, 0) + 1
+            if _t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]:
+                _dca_syms.append(_t["symbol"])
+            if _g in ("A", "B"):
+                _ab_syms.append(_t["symbol"])
+            if _g == "D":
+                _d_syms.append(_t["symbol"])
         print(f"  [TDE] 실시간 데이터 검증 통과: {_tde_passed}개 / {_tde_total}개", flush=True)
-        print(f"  [TDE] 신규 매수 A/B 조건 통과: PENDING (2단계에서 계산)", flush=True)
+        print(f"  [TDE] buy_grade 분포: A={_grade_cnt['A']} / B={_grade_cnt['B']} / C={_grade_cnt['C']} / D={_grade_cnt['D']} / PENDING={_grade_cnt.get('PENDING',0)}", flush=True)
+        print(f"  [TDE] 자동 적립 유지 가능: {_dca_syms}", flush=True)
+        print(f"  [TDE] 신규 목돈 매수 A/B 후보: {_ab_syms}", flush=True)
+        print(f"  [TDE] 신규 목돈 매수 금지(D): {_d_syms}", flush=True)
         if _tde_missing:
             print(f"  [TDE] price_missing: {_tde_missing}", flush=True)
     except Exception as _e:
