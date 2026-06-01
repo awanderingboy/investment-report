@@ -1551,6 +1551,136 @@ def validate_report(report: str, pf: dict, all_stock_data: dict, exchange_rate: 
     return errors
 
 
+# ── TDE (Trade Decision Engine) ───────────────────────────────────────────────
+def build_trade_decision_engine(
+    us_data,
+    kr_data,
+    portfolio,
+    learning_summary,
+    macro_data,
+    news_data=None,
+    earnings_data=None
+):
+    """
+    종목별 trade_decision JSON을 생성한다.
+    1단계: 데이터 구조 뼈대만 만든다. buy_grade 완성 계산은 2단계에서 한다.
+    """
+    all_data = {**us_data, **kr_data}
+
+    # 포트폴리오 전체 종목 목록 (데이터 수집 실패 종목 포함)
+    pf_tickers = {}
+    for cat in ["category1", "category2"]:
+        for it in portfolio.get(cat, []):
+            pf_tickers[it["ticker"]] = it.get("name", it["ticker"])
+    all_tickers_ordered = list(dict.fromkeys(list(pf_tickers.keys()) + list(all_data.keys())))
+
+    _cat_map = {
+        "핵심장기보유": "유형①",
+        "고위험옵션":   "유형③",
+        "회복탈출관리": "유형④",
+        "성장스윙":     "유형②",
+    }
+
+    def _not_na(v):
+        if v is None or v == "N/A":
+            return False
+        return _safe_float(v) is not None
+
+    results = []
+    for ticker in all_tickers_ordered:
+        data = all_data.get(ticker, {})
+        current_price = _safe_float(data.get("현재가"))
+        name = pf_tickers.get(ticker, ticker)
+
+        # 종목 유형 분류
+        raw_type = _classify_stock_type(ticker, portfolio, current_price)
+        category = _cat_map.get(raw_type, "유형②")
+
+        # ── data_status ───────────────────────────────────────────
+        price_collected = current_price is not None
+        volume_collected = _safe_float(data.get("거래량비율(5일/20일)")) is not None
+        technical_collected = (
+            _safe_float(data.get("RSI14")) is not None
+            or any(_safe_float(data.get(f"MA{p}")) is not None for p in [5, 20, 60, 120])
+            or _safe_float(data.get("MACD")) is not None
+        )
+        fundamental_collected = (
+            _not_na(data.get("PER"))
+            or _not_na(data.get("PBR"))
+            or _not_na(data.get("영업이익률"))
+        )
+        news_collected = bool(news_data and news_data.get(ticker))
+
+        data_issues = []
+        if not price_collected:      data_issues.append("price_missing")
+        if not volume_collected:     data_issues.append("volume_missing")
+        if not technical_collected:  data_issues.append("technical_missing")
+        if not fundamental_collected: data_issues.append("fundamental_missing")
+        if not news_collected:       data_issues.append("news_missing")
+
+        if not price_collected:
+            data_quality = "D"
+        elif technical_collected and fundamental_collected and volume_collected and news_collected:
+            data_quality = "A"
+        elif technical_collected and fundamental_collected:
+            data_quality = "B"
+        else:
+            data_quality = "C"
+
+        # ── trade_eligibility ─────────────────────────────────────
+        hold_grade   = "A" if data_quality in ("A", "B", "C") else "D"
+        hold_allowed = price_collected and data_quality in ("A", "B", "C")
+        buy_allowed  = False   # 1단계: PENDING 고정
+        sell_allowed = False   # 1단계: PENDING 고정
+
+        failure_conditions = []
+        if not price_collected:
+            failure_conditions.append("price_missing")
+
+        results.append({
+            "symbol": ticker,
+            "name": name,
+            "category": category,
+            "data_status": {
+                "price_collected":       price_collected,
+                "volume_collected":      volume_collected,
+                "news_collected":        news_collected,
+                "technical_collected":   technical_collected,
+                "fundamental_collected": fundamental_collected,
+                "data_quality":          data_quality,
+                "data_issues":           data_issues,
+            },
+            "trade_eligibility": {
+                "buy_grade":   "PENDING",
+                "sell_grade":  "PENDING",
+                "hold_grade":  hold_grade,
+                "buy_allowed": buy_allowed,
+                "sell_allowed": sell_allowed,
+                "hold_allowed": hold_allowed,
+                "reason": ["buy_grade 계산은 2단계에서 완성"],
+            },
+            "risk_reward": {
+                "entry_price":       None,
+                "stop_price":        None,
+                "target_price":      None,
+                "expected_gain_pct": None,
+                "expected_loss_pct": None,
+                "reward_risk_ratio": None,
+                "valid":             False,
+            },
+            "position_action": {
+                "today_action":      "",
+                "conditional_action": "",
+                "forbidden_action":  "",
+                "position_size":     "",
+                "cash_impact":       "",
+            },
+            "failure_conditions": failure_conditions,
+        })
+
+    return results
+
+
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
@@ -3422,6 +3552,29 @@ def run_daily_report():
     except Exception as e:
         print(f"  [LEARNING] 패턴 분석 실패: {e}", flush=True)
         patterns_str = "패턴 분석 실패"
+
+    # TDE Stage 1: 데이터 구조 뼈대 생성 및 로그 출력
+    try:
+        _learning_summary = p5 if isinstance(locals().get("p5"), dict) else {}
+        tde_results = build_trade_decision_engine(
+            us_data=us_data,
+            kr_data=kr_data,
+            portfolio=portfolio_data,
+            learning_summary=_learning_summary,
+            macro_data=macro_data,
+            news_data=news_data,
+            earnings_data=earnings_data if "earnings_data" in dir() else None,
+        )
+        _tde_total  = len(tde_results)
+        _tde_passed = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
+        _tde_missing = [t["symbol"] for t in tde_results if not t["data_status"]["price_collected"]]
+        print(f"  [TDE] 실시간 데이터 검증 통과: {_tde_passed}개 / {_tde_total}개", flush=True)
+        print(f"  [TDE] 신규 매수 A/B 조건 통과: PENDING (2단계에서 계산)", flush=True)
+        if _tde_missing:
+            print(f"  [TDE] price_missing: {_tde_missing}", flush=True)
+    except Exception as _e:
+        print(f"  [TDE] 실행 실패: {_e}", flush=True)
+        tde_results = []
 
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
