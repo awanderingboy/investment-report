@@ -2,7 +2,7 @@ name: Daily Investment Report
 
 on:
   schedule:
-    - cron: '0 22 * * *'  # UTC 22:00 = KST 07:00
+    - cron: '13 22 * * *'  # UTC 22:13 = KST 07:13
   workflow_dispatch:       # GitHub UI에서 수동 실행 가능
 
 jobs:
