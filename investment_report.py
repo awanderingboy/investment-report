@@ -1902,6 +1902,138 @@ def build_trade_decision_engine(
     return results
 
 
+# ── TDE 보고서 섹션 렌더러 ─────────────────────────────────────────────────────
+def render_tde_report_section(tde_results):
+    """
+    TDE 결과를 보고서 본문에 붙일 deterministic section으로 변환한다.
+    LLM이 아닌 코드가 직접 생성한다.
+    """
+    if not tde_results:
+        return (
+            "## 🧠 TDE 실전 매매 판단 엔진\n\n"
+            "TDE 결과 없음 — 데이터 구조 확인 필요"
+        )
+
+    lines = ["## 🧠 TDE 실전 매매 판단 엔진", ""]
+
+    # ── 1. TDE 요약 ───────────────────────────────────────────────────────────
+    total   = len(tde_results)
+    passed  = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
+    ab_list = [t["name"] for t in tde_results if t["trade_eligibility"]["buy_grade"] in ("A", "B")]
+    dca_list= [t["name"] for t in tde_results if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
+    d_list  = [t["name"] for t in tde_results if t["trade_eligibility"]["buy_grade"] == "D"]
+    d_str   = ", ".join(d_list[:6]) + ("..." if len(d_list) > 6 else "")
+
+    lines += [
+        "| 항목 | 결과 |",
+        "| --- | --- |",
+        f"| 실시간 데이터 검증 통과 | {passed}개 / {total}개 |",
+        f"| 신규 목돈 매수 A/B 후보 | {len(ab_list)}개 |",
+        f"| 자동 적립 유지 가능 | {', '.join(dca_list) if dca_list else '없음'} |",
+        f"| 신규 목돈 매수 금지(D) | {d_str if d_list else '없음'} |",
+        "",
+    ]
+
+    # ── 2. 신규 매수 실행표 ───────────────────────────────────────────────────
+    lines += ["신규 매수 실행표", ""]
+
+    valid_ab   = [t for t in tde_results
+                  if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+                  and t["risk_reward"]["valid"]]
+    invalid_ab = [t for t in tde_results
+                  if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+                  and not t["risk_reward"]["valid"]]
+
+    if valid_ab:
+        lines += [
+            "| 종목 | 등급 | 현재가 | 진입 가능 | 손절가 | 목표가 | 예상손실 | 기대수익 | R/R | 이유 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for t in valid_ab:
+            te  = t["trade_eligibility"]
+            rr  = t["risk_reward"]
+            sym = t["symbol"]
+            is_kr = sym.endswith(".KS") or sym.endswith(".KQ")
+            cur = "₩" if is_kr else "$"
+            def _fmt(v):
+                if v is None:
+                    return "-"
+                return f"{cur}{v:,.0f}" if is_kr else f"{cur}{v:.2f}"
+            gain_str = f"{rr['expected_gain_pct']:.1f}%" if rr["expected_gain_pct"] is not None else "-"
+            loss_str = f"{rr['expected_loss_pct']:.1f}%" if rr["expected_loss_pct"] is not None else "-"
+            rr_str   = f"{rr['reward_risk_ratio']:.2f}"  if rr["reward_risk_ratio"]  is not None else "-"
+            reason0  = te["reason"][0][:45] if te["reason"] else "-"
+            lines.append(
+                f"| {t['name']}({sym}) | {te['buy_grade']} | {_fmt(rr['entry_price'])} "
+                f"| O | {_fmt(rr['stop_price'])} | {_fmt(rr['target_price'])} "
+                f"| {loss_str} | {gain_str} | {rr_str} | {reason0} |"
+            )
+        lines.append("")
+    else:
+        lines += ["신규 매수 실행표 없음 — TDE 기준 A/B 조건 통과 종목 0개", ""]
+
+    if invalid_ab:
+        lines += [
+            "⚠️ TDE 경고: A/B 등급인데 risk_reward.valid=false인 종목이 있습니다. 4단계 실패 조건 검증 필요.",
+            "",
+        ]
+
+    # ── 3. 자동 적립 유지표 ──────────────────────────────────────────────────
+    lines += ["자동 적립 유지표", ""]
+    dca_items = [t for t in tde_results if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
+    if dca_items:
+        lines += [
+            "| 종목 | 자동 적립 | 신규 목돈 매수 | 이유 |",
+            "| --- | --- | --- | --- |",
+        ]
+        for t in dca_items:
+            te   = t["trade_eligibility"]
+            bt   = te["buy_type"]
+            lump = "가능" if bt["lump_sum_buy_allowed"] else "금지"
+            r0   = te["reason"][0][:50] if te["reason"] else "-"
+            lines.append(f"| {t['name']}({t['symbol']}) | 유지 가능 | {lump} | {r0} |")
+        lines.append("")
+    else:
+        lines += ["자동 적립 유지 가능 종목 없음", ""]
+
+    # ── 4. 오늘 금지 행동 ────────────────────────────────────────────────────
+    lines += ["오늘 금지 행동", ""]
+    d_items = [t for t in tde_results if t["trade_eligibility"]["buy_grade"] == "D"]
+    if d_items:
+        lines += [
+            "| 종목 | 금지 행동 | 이유 |",
+            "| --- | --- | --- |",
+        ]
+        for t in d_items:
+            cat = t["category"]
+            ds  = t["data_status"]
+            if not ds["price_collected"]:
+                action = "데이터 미수집 — 매매 금지"
+            elif cat == "유형③":
+                action = "신규/추매 금지"
+            elif cat == "유형④":
+                action = "물타기 금지"
+            elif cat == "유형①":
+                action = "목돈 추격매수 금지"
+            else:
+                action = "신규 매수 금지"
+            r0 = t["trade_eligibility"]["reason"][0][:50] if t["trade_eligibility"]["reason"] else "-"
+            lines.append(f"| {t['name']}({t['symbol']}) | {action} | {r0} |")
+        lines.append("")
+
+    # ── 5. 오늘 실제 주문 가능 여부 ─────────────────────────────────────────
+    if valid_ab:
+        lines.append(
+            "오늘 실제 신규 매수 후보 있음 — "
+            "단, 3단계에서는 주문 수량 자동 계산 전이므로 4단계 전까지 수동 검토 필요"
+        )
+    else:
+        lines.append("오늘 실제 신규 매수 주문 없음")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 # ── 보고서 생성 ───────────────────────────────────────────────────────────────
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
@@ -3328,6 +3460,9 @@ PLTR은 RGTI와 같은 "손실 제한 감시" 종목이 아니다. PLTR은 유�
 - 모델 판단과 실제 데이터가 충돌하면 실제 데이터를 우선
 - 동의할 것은 동의하고, 반대할 것은 반대하는 명확한 판단
 - 일부러 장황하게 만들지 말고 핵심 행동 중심으로 작성
+
+[TDE 실전 매매 판단 엔진 우선 원칙]
+TDE 실전 매매 판단 엔진 섹션은 코드가 계산한 결과이므로, LLM 본문 판단보다 우선한다. LLM은 TDE의 buy_grade, 자동 적립 가능 여부, 신규 목돈 매수 금지 판단을 임의로 상향하거나 덮어쓰지 않는다.
 """
 
     static_system = (
@@ -3931,6 +4066,17 @@ def run_daily_report():
         save_learning_log(log_entry)
     except Exception as e:
         print(f"  learning_log 저장 실패: {e}", flush=True)
+
+    # TDE 섹션을 보고서 하단에 추가 (코드가 직접 생성 — LLM 본문 훼손 없음)
+    try:
+        if isinstance(report, str):
+            tde_section = render_tde_report_section(tde_results if tde_results else [])
+            report = report + "\n\n" + tde_section
+            print(f"  [TDE] 보고서 하단에 TDE 섹션 추가 완료 ({len(tde_section)}자)", flush=True)
+        else:
+            print(f"  [TDE][WARN] report가 문자열이 아님 — TDE 섹션 추가 생략 (type={type(report)})", flush=True)
+    except Exception as _te:
+        print(f"  [TDE][WARN] TDE 섹션 추가 실패: {_te}", flush=True)
 
     print(f"\n이메일 발송", flush=True)
     send_email(report)
