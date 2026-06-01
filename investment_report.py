@@ -3791,6 +3791,13 @@ def run_daily_report():
             earnings_data=earnings_data if "earnings_data" in dir() else None,
             exchange_rate=exchange_rate,
         )
+        # exchange_rate 실제 사용 값 확인
+        _exr_val = _safe_float(exchange_rate)
+        if _exr_val:
+            print(f"  [TDE] exchange_rate used: {_exr_val}", flush=True)
+        else:
+            print(f"  [TDE][WARN] exchange_rate missing — fallback 1400.0 used. KRW position weight may be inaccurate.", flush=True)
+
         _tde_total   = len(tde_results)
         _tde_passed  = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
         _tde_missing = [t["symbol"] for t in tde_results if not t["data_status"]["price_collected"]]
