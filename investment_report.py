@@ -45,8 +45,9 @@ KR_TICKERS = [
     "042700.KS",  # 한미반도체
 ]
 INSIDER_TICKERS = ["NVDA", "GOOGL", "FCX", "PLTR", "BEAM", "PWFL", "VOO"]
-PORTFOLIO_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
-FEAR_GREED_CACHE = "/tmp/fear_greed_cache.json"
+PORTFOLIO_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
+SENT_REPORTS_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sent_reports.json")
+FEAR_GREED_CACHE   = "/tmp/fear_greed_cache.json"
 
 _HARDCODED_PORTFOLIO = {
     "cash": {"krw": 13585062, "usd": 3566},
@@ -153,6 +154,46 @@ def update_dca_portfolio(portfolio_data: dict, us_data: dict, exchange_rate: flo
     return pf
 
 
+# ── 중복 발송 방지 (Send Guard) ───────────────────────────────────────────────
+# NOTE: GitHub Actions fresh runner에서는 파일 상태가 보존되지 않으므로
+# 외부 cron 중복 방지를 완전히 보장하려면 Gmail 검색 또는 원격 상태 저장이 필요하다.
+
+def _today_kst() -> str:
+    """KST 기준 오늘 날짜 문자열 반환 (YYYY-MM-DD)."""
+    from datetime import timezone, timedelta as _td
+    kst = timezone(_td(hours=9))
+    return datetime.now(tz=kst).strftime("%Y-%m-%d")
+
+def _load_sent_reports() -> dict:
+    try:
+        with open(SENT_REPORTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_sent_reports(data: dict) -> None:
+    with open(SENT_REPORTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def already_sent_today(report_type: str = "daily") -> bool:
+    """FORCE_SEND_REPORT=true이면 항상 False를 반환해 재발송을 허용한다."""
+    if os.environ.get("FORCE_SEND_REPORT", "").lower() == "true":
+        return False
+    data = _load_sent_reports()
+    today = _today_kst()
+    entry = data.get(today, {})
+    return entry.get("report_type") == report_type and entry.get("status") == "sent"
+
+def mark_sent_today(report_type: str = "daily") -> None:
+    from datetime import timezone, timedelta as _td
+    kst = timezone(_td(hours=9))
+    sent_at = datetime.now(tz=kst).isoformat(timespec="seconds")
+    data = _load_sent_reports()
+    data[_today_kst()] = {"sent_at": sent_at, "report_type": report_type, "status": "sent"}
+    _save_sent_reports(data)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def load_portfolio() -> dict:
     try:
         with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
@@ -221,10 +262,11 @@ def get_macro_data():
         "Gold": "GC=F",
     }
     _range_bounds = {
-        "VIX":  (10,   80),
-        "DXY":  (85,  115),
+        "VIX":  (10,    80),
+        "DXY":  (85,   115),
         "WTI":  (50,   120),
         "Gold": (1800, 5500),
+        "TNX":  (1.0,  7.0),   # 10년물 금리 정상 범위 (%)
     }
     _fallback_urls = {
         "WTI":  "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=1d&range=5d",
@@ -288,6 +330,9 @@ def get_macro_data():
             lo, hi = _range_bounds[name]
             if not (lo <= current <= hi):
                 print(f"  ⚠️ [{name}] 범위 이탈 ({round(current, 2)}) — None 처리", flush=True)
+                if name == "TNX":
+                    print(f"  [MACRO][WARN] TNX out of expected range: {round(current, 2)}", flush=True)
+                    results["TNX_WARN"] = "⚠️ 10년물 금리 데이터 이상치 — 금리 기반 판단 강도 낮춤"
                 results[name] = None
                 continue
 
@@ -4346,7 +4391,11 @@ def run_daily_report():
         print(f"  [TDE][WARN] TDE 섹션 추가 실패: {_te}", flush=True)
 
     print(f"\n이메일 발송", flush=True)
-    send_email(report)
+    if already_sent_today("daily"):
+        print("  [SEND-GUARD] already sent today — skip email", flush=True)
+    else:
+        send_email(report)
+        mark_sent_today("daily")
 
     print(f"\n{'='*50}", flush=True)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 전체 완료", flush=True)
