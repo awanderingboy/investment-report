@@ -210,20 +210,55 @@ def _imap_date_kst() -> str:
     mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][now.month - 1]
     return f"{now.day:02d}-{mon}-{now.year}"
 
-def _imap_search_mailbox_for_subject(imap, mailbox: str, subject: str) -> bool:
-    """지정 mailbox에서 subject가 포함된 오늘 메일을 검색한다. 실패 시 False."""
-    import imaplib
+def _decode_email_subject(raw_subject) -> str:
+    """email.header.decode_header로 제목을 디코딩한다. 인코딩 오류는 replace로 처리."""
+    import email.header as _eh
+    if not raw_subject:
+        return ""
+    parts = []
+    for decoded, charset in _eh.decode_header(raw_subject):
+        if isinstance(decoded, bytes):
+            try:
+                parts.append(decoded.decode(charset or "utf-8", errors="replace"))
+            except Exception:
+                parts.append(decoded.decode("utf-8", errors="replace"))
+        else:
+            parts.append(str(decoded))
+    return "".join(parts)
+
+def _mailbox_has_today_report_by_header(imap, mailbox: str, today_date_str: str) -> bool:
+    """
+    IMAP SUBJECT 검색 대신 SINCE 날짜 검색 + RFC822.HEADER fetch + Python 비교 방식.
+    한글/이모지 제목의 ASCII 인코딩 문제를 우회한다.
+    """
+    import email as _email_mod
     try:
         status, _ = imap.select(mailbox, readonly=True)
         if status != "OK":
             print(f"  [SEND-GUARD][WARN] mailbox 선택 실패: {mailbox}", flush=True)
             return False
-        since = _imap_date_kst()
-        # UTF-8 제목 검색: Gmail IMAP은 SUBJECT 리터럴 검색을 지원
-        _, data = imap.search(None, "CHARSET", "UTF-8",
-                              "SINCE", since,
-                              "SUBJECT", subject)
-        return bool(data and data[0] and data[0].split())
+        # SINCE만 사용 — ASCII-safe, SUBJECT는 Python에서 비교
+        _, data = imap.search(None, "SINCE", _imap_date_kst())
+        if not data or not data[0]:
+            print(f"  [SEND-GUARD] checked {mailbox}: 0 messages", flush=True)
+            return False
+        msg_ids = data[0].split()[-50:]  # 최근 50개까지만 확인
+        print(f"  [SEND-GUARD] checked {mailbox}: {len(msg_ids)} messages", flush=True)
+        for mid in msg_ids:
+            try:
+                _, hdr_data = imap.fetch(mid, "(RFC822.HEADER)")
+                if not hdr_data or not hdr_data[0]:
+                    continue
+                raw = hdr_data[0][1] if isinstance(hdr_data[0], tuple) else hdr_data[0]
+                msg = _email_mod.message_from_bytes(raw)
+                subject = _decode_email_subject(msg.get("Subject", ""))
+                if "투자 분석 보고서" in subject and today_date_str in subject:
+                    print(f"  [SEND-GUARD] Gmail duplicate found in {mailbox}: {subject}", flush=True)
+                    return True
+            except Exception as e:
+                print(f"  [SEND-GUARD][WARN] fetch 실패 mid={mid}: {e}", flush=True)
+                continue
+        return False
     except Exception as e:
         print(f"  [SEND-GUARD][WARN] mailbox={mailbox} 검색 실패: {e}", flush=True)
         return False
@@ -231,6 +266,7 @@ def _imap_search_mailbox_for_subject(imap, mailbox: str, subject: str) -> bool:
 def gmail_report_exists_today(report_type: str = "daily") -> bool:
     """
     Gmail IMAP으로 오늘 보고서가 이미 발송됐는지 확인한다.
+    SINCE 날짜 검색 + 헤더 fetch + Python 제목 비교 방식으로 한글/이모지 인코딩 문제를 우회한다.
     FORCE_SEND_REPORT=true이면 체크를 우회해 False를 반환한다.
     IMAP 연결/검색 실패 시 False를 반환해 발송을 허용한다.
     """
@@ -241,14 +277,24 @@ def gmail_report_exists_today(report_type: str = "daily") -> bool:
         print("  [SEND-GUARD][WARN] Gmail 자격증명 없음 — IMAP 중복 체크 스킵", flush=True)
         return False
 
-    subject = _today_report_subject_kst()
-    # 검색할 mailbox 후보 (INBOX 우선, Sent 순서)
-    mailboxes = ["INBOX", "[Gmail]/Sent Mail", '"[Gmail]/Sent Mail"', "[Gmail]/보낸편지함"]
+    # KST 오늘 날짜 문자열 — 제목 비교 기준
+    from datetime import timezone, timedelta as _td
+    _kst = timezone(_td(hours=9))
+    today_date_str = datetime.now(tz=_kst).strftime("%Y년 %m월 %d일")
+
+    # mailbox 후보: 영문명 우선, 한글명은 계정 언어에 따라 다를 수 있으므로 실패 허용
+    mailboxes = [
+        "INBOX",
+        "[Gmail]/Sent Mail",
+        "[Gmail]/All Mail",
+        "[Gmail]/보낸편지함",
+        "[Gmail]/전체보관함",
+    ]
     try:
         imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         for mb in mailboxes:
-            if _imap_search_mailbox_for_subject(imap, mb, subject):
+            if _mailbox_has_today_report_by_header(imap, mb, today_date_str):
                 imap.logout()
                 return True
         imap.logout()
