@@ -164,6 +164,19 @@ def _today_kst() -> str:
     kst = timezone(_td(hours=9))
     return datetime.now(tz=kst).strftime("%Y-%m-%d")
 
+def _now_kst():
+    """KST 현재 시간 반환 (timezone-aware datetime)."""
+    from datetime import timezone, timedelta as _td
+    return datetime.now(tz=timezone(_td(hours=9)))
+
+def _report_date_kst_str() -> str:
+    """KST 기준 오늘 날짜 보고서 표시용 문자열. 예: 2026년 06월 03일"""
+    return _now_kst().strftime("%Y년 %m월 %d일")
+
+def _report_timestamp_kst_str() -> str:
+    """KST 기준 현재 시각 보고서 표시용 문자열. 예: 2026-06-03 07:17 KST"""
+    return _now_kst().strftime("%Y-%m-%d %H:%M KST")
+
 def _load_sent_reports() -> dict:
     try:
         with open(SENT_REPORTS_FILE, "r", encoding="utf-8") as f:
@@ -2100,7 +2113,7 @@ def build_trade_decision_engine(
 
 
 # ── TDE/LLM 충돌 감지 ────────────────────────────────────────────────────────
-def detect_tde_llm_conflicts(report, tde_results):
+def detect_tde_llm_conflicts(report, tde_results, price_trigger_results=None):
     """
     LLM 본문과 TDE 결과가 충돌하는지 탐지한다.
     긍정형 매수/추매 표현만 감지하고 금지 표현은 false positive 방지한다.
@@ -2108,8 +2121,11 @@ def detect_tde_llm_conflicts(report, tde_results):
     """
     import re as _re
     conflicts = []
-    if not tde_results or not isinstance(report, str):
+    if not isinstance(report, str):
         return conflicts
+    # tde_results가 비어도 price_trigger_results 충돌 체크는 실행한다
+    if not tde_results:
+        tde_results = []
 
     ab_count = sum(
         1 for t in tde_results
@@ -2237,6 +2253,40 @@ def detect_tde_llm_conflicts(report, tde_results):
                     })
                     break
 
+    # 5. 가격 조건 발동 표현 충돌 — TRIGGERED 종목인데 본문이 조건부 표현만 사용
+    if price_trigger_results:
+        for _tr in price_trigger_results:
+            if _tr["status"] != "TRIGGERED":
+                continue
+            _cphrases = _tr.get("conflict_phrases", [])
+            _aphrases = _tr.get("affirm_phrases", [])
+            if not _cphrases or not _aphrases:
+                continue
+            _sym  = _tr["symbol"]
+            _name = _tr["name"]
+            # 종목명 또는 ticker가 포함된 라인에서만 검사
+            _search_keys = [_name, _sym.replace(".KS", "").replace(".KQ", "")]
+            for _line in report.splitlines():
+                if not any(_k in _line for _k in _search_keys):
+                    continue
+                # 본문에 발동 인정 표현이 있으면 충돌 아님
+                if any(_af in _line for _af in _aphrases):
+                    break
+                # 조건부 표현만 있으면 충돌
+                if any(_cf in _line for _cf in _cphrases):
+                    cp = _tr["condition_price"]
+                    ct = _tr["condition_type"]
+                    _cp_str = f"{cp:,.0f}원" if (_sym.endswith(".KS") or _sym.endswith(".KQ")) else f"{cp}달러"
+                    conflicts.append({
+                        "type": "가격 조건 발동 표현 충돌",
+                        "detail": (
+                            f"{_name}은 {_cp_str} 기준을 이미 이탈했지만 "
+                            f"본문이 조건부 표현만 사용했습니다. "
+                            f"'{_tr.get('triggered_action', '이미 발동 — 즉시 재검토 필요')}'로 표현해야 합니다."
+                        ),
+                    })
+                    break
+
     return conflicts
 
 
@@ -2273,6 +2323,204 @@ def _short_tde_reason(tde_item):
         r = te["reason"][0]
         return r[:50] if len(r) <= 50 else r[:47] + "..."
     return "-"
+
+
+# ── 가격 조건 발동 판정 ───────────────────────────────────────────────────────
+
+def evaluate_price_trigger_status(symbol, name, current_price, condition_price,
+                                   condition_type, tolerance_pct=0.03):
+    """현재가와 기준가를 비교해 가격 조건 상태를 판정한다.
+
+    condition_type: "below" | "below_or_equal" | "above" | "above_or_equal"
+    status 반환: "TRIGGERED" | "NEAR" | "NOT_REACHED" | "UNKNOWN"
+    """
+    base = {
+        "symbol": symbol, "name": name,
+        "current_price": current_price, "condition_price": condition_price,
+        "condition_type": condition_type,
+    }
+    if current_price is None or condition_price is None or condition_price == 0:
+        return {**base, "status": "UNKNOWN", "distance_pct": None,
+                "message": "데이터 부족 — 수동 확인 필요"}
+
+    if condition_type in ("below", "below_or_equal"):
+        triggered = (current_price < condition_price) if condition_type == "below" \
+                    else (current_price <= condition_price)
+        # distance_pct: 양수 = 기준 위(아직 미도달), 음수 = 기준 아래(발동)
+        distance_pct = (current_price - condition_price) / condition_price * 100
+        if triggered:
+            status, message = "TRIGGERED", "이미 발동 — 즉시 재검토 필요"
+        elif distance_pct <= tolerance_pct * 100:
+            status, message = "NEAR", "기준가 근접 — 알림 유지"
+        else:
+            status, message = "NOT_REACHED", "미도달 — 조건부 대기"
+    elif condition_type in ("above", "above_or_equal"):
+        triggered = (current_price > condition_price) if condition_type == "above" \
+                    else (current_price >= condition_price)
+        # distance_pct: 양수 = 기준 아래(아직 미도달), 음수 = 기준 위(발동)
+        distance_pct = (condition_price - current_price) / condition_price * 100
+        if triggered:
+            status, message = "TRIGGERED", "이미 발동 — 즉시 재검토 필요"
+        elif distance_pct <= tolerance_pct * 100:
+            status, message = "NEAR", "기준가 근접 — 알림 유지"
+        else:
+            status, message = "NOT_REACHED", "미도달 — 조건부 대기"
+    else:
+        return {**base, "status": "UNKNOWN", "distance_pct": None,
+                "message": "데이터 부족 — 수동 확인 필요"}
+
+    return {**base, "status": status, "distance_pct": distance_pct, "message": message}
+
+
+# 가격 조건 발동 감시 대상 종목 설정
+_PRICE_TRIGGER_CONFIGS = [
+    {
+        "symbol": "068760.KS", "name": "셀트리온제약",
+        "condition_price": 46500, "condition_type": "below",
+        "triggered_action": "46,500원 기준 이미 이탈 — 회복 전략 훼손, 100~150주 축소 여부 즉시 재검토",
+        "near_action": "46,500원 근접 — 알림 유지, 이탈 시 일부 축소 검토",
+        "conflict_phrases": ["이탈 시", "도달 시", "알림 설정"],
+        "affirm_phrases":   ["이미 발동", "즉시 재검토", "기준 이탈", "이미 이탈"],
+    },
+    {
+        "symbol": "042700.KS", "name": "한미반도체",
+        "condition_price": 280000, "condition_type": "below",
+        "triggered_action": "280,000원 기준 이미 이탈 — 비중 1% 미만이므로 급매도보다 축소 여부 재검토",
+        "near_action": "280,000원 근접 — 알림 유지",
+        "conflict_phrases": ["이탈 시", "전까지 보유"],
+        "affirm_phrases":   ["이미 발동", "즉시 재검토", "기준 이탈", "이미 이탈"],
+    },
+    {
+        "symbol": "RGTI", "name": "RGTI",
+        "condition_price": 22, "condition_type": "below",
+        "triggered_action": "22달러 기준 이미 이탈 — 절반 축소 검토",
+        "near_action": "22달러 근접 — 손실 제한 감시 유지",
+        "conflict_phrases": ["이탈 시"],
+        "affirm_phrases":   ["이미 발동", "즉시 재검토", "기준 이탈", "이미 이탈"],
+    },
+    {
+        "symbol": "BEAM", "name": "BEAM",
+        "condition_price": 25, "condition_type": "below",
+        "triggered_action": "25달러 기준 이미 이탈 — 절반 축소 검토",
+        "near_action": "25달러 근접 — 손실 제한 감시 유지",
+        "conflict_phrases": ["이탈 시"],
+        "affirm_phrases":   ["이미 발동", "즉시 재검토", "기준 이탈", "이미 이탈"],
+    },
+    {
+        "symbol": "035420.KS", "name": "네이버",
+        "condition_price": 287000, "condition_type": "above_or_equal",
+        "triggered_action": "287,000원 도달 — 5~10주 분할 익절 검토",
+        "near_action": "287,000원 근접 — 익절 알림 유지",
+        "conflict_phrases": [],
+        "affirm_phrases":   [],
+    },
+    {
+        "symbol": "GOOGL", "name": "GOOGL",
+        "condition_price": 370, "condition_type": "below_or_equal",
+        "triggered_action": "370달러 이하 도달 — 단, 모델 신뢰도/신규 매수 모드 조건 통과 전까지 목돈 매수 보류",
+        "near_action": "370달러 근접 — 추가 일시매수 조건 감시",
+        "conflict_phrases": [],
+        "affirm_phrases":   [],
+    },
+    {
+        "symbol": "VOO", "name": "VOO",
+        "condition_price": 670, "condition_type": "below_or_equal",
+        "triggered_action": "670달러 이하 도달 — 추가 일시매수 조건 충족, RSI/신규 매수 모드 병행 확인",
+        "near_action": "670달러 근접 — 적립재개 조건 감시",
+        "conflict_phrases": [],
+        "affirm_phrases":   [],
+    },
+    {
+        "symbol": "FCX", "name": "FCX",
+        "condition_price": 60, "condition_type": "below_or_equal",
+        "triggered_action": "60달러 이하 도달 — 추가 일시매수 조건 충족, RSI/신규 매수 모드 병행 확인",
+        "near_action": "60달러 근접 — 추가 일시매수 조건 감시",
+        "conflict_phrases": [],
+        "affirm_phrases":   [],
+    },
+]
+
+
+def build_price_trigger_table(all_stock_data: dict) -> list:
+    """가격 조건 발동 상태를 평가해 결과 리스트를 반환한다."""
+    results = []
+    for cfg in _PRICE_TRIGGER_CONFIGS:
+        sym = cfg["symbol"]
+        data = all_stock_data.get(sym, {})
+        current_price = _safe_float(data.get("현재가"))
+        result = evaluate_price_trigger_status(
+            symbol=sym, name=cfg["name"],
+            current_price=current_price,
+            condition_price=cfg["condition_price"],
+            condition_type=cfg["condition_type"],
+        )
+        result["triggered_action"] = cfg["triggered_action"]
+        result["near_action"]      = cfg["near_action"]
+        result["conflict_phrases"] = cfg.get("conflict_phrases", [])
+        result["affirm_phrases"]   = cfg.get("affirm_phrases", [])
+        results.append(result)
+    return results
+
+
+def render_price_trigger_section(trigger_results: list) -> str:
+    """가격 조건 발동 검증표 섹션 문자열을 생성한다 (코드 직접 생성)."""
+    if not trigger_results:
+        return ""
+
+    _EMOJI = {
+        "TRIGGERED":  "🚨 이미 발동",
+        "NEAR":       "⚠️ 근접",
+        "NOT_REACHED": "대기",
+        "UNKNOWN":    "데이터 부족",
+    }
+
+    triggered_names = [r["name"] for r in trigger_results if r["status"] == "TRIGGERED"]
+    lines = ["🚨 가격 조건 발동 검증", ""]
+
+    if triggered_names:
+        lines.append(f"⚠️ 가격 조건 발동 종목 있음: {', '.join(triggered_names)}")
+        lines.append("")
+
+    lines += [
+        "| 종목 | 현재가 | 기준가 | 상태 | 판단 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+
+    for r in trigger_results:
+        sym  = r["symbol"]
+        is_kr = sym.endswith(".KS") or sym.endswith(".KQ")
+        unit  = "원" if is_kr else "달러"
+
+        if r["current_price"] is not None:
+            cur_str = (f"{r['current_price']:,.0f}{unit}" if is_kr
+                       else f"{r['current_price']:.2f}{unit}")
+        else:
+            cur_str = "-"
+
+        cp = r["condition_price"]
+        cond_raw = (f"{cp:,.0f}{unit}" if is_kr else f"{cp}{unit}")
+        _cond_label_map = {
+            "below":          f"{cond_raw} 이탈",
+            "below_or_equal": f"{cond_raw} 이하",
+            "above":          f"{cond_raw} 초과",
+            "above_or_equal": f"{cond_raw} 도달",
+        }
+        cond_label = _cond_label_map.get(r["condition_type"], cond_raw)
+        status_str = _EMOJI.get(r["status"], r["status"])
+
+        if r["status"] == "TRIGGERED":
+            action = r.get("triggered_action", r["message"])
+        elif r["status"] == "NEAR":
+            action = r.get("near_action", r["message"])
+        elif r["status"] == "NOT_REACHED":
+            action = "감시 유지"
+        else:
+            action = "수동 확인 필요"
+
+        lines.append(f"| {r['name']} | {cur_str} | {cond_label} | {status_str} | {action} |")
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ── TDE 보고서 섹션 렌더러 ─────────────────────────────────────────────────────
@@ -2438,10 +2686,11 @@ def render_tde_report_section(tde_results):
 def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
                     congress_trades, put_call_ratio, portfolio_data=None,
-                    news_data=None, earnings_data=None, patterns_str=None):
+                    news_data=None, earnings_data=None, patterns_str=None,
+                    price_trigger_str=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    today = datetime.now().strftime("%Y년 %m월 %d일")
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    today        = _report_date_kst_str()       # KST 기준 날짜 (예: 2026년 06월 03일)
+    generated_at = _report_timestamp_kst_str()  # KST 기준 타임스탬프 (예: 2026-06-03 07:17 KST)
 
     pf           = portfolio_data if portfolio_data is not None else _HARDCODED_PORTFOLIO
     _pf_section  = _portfolio_section_str(pf, exchange_rate)
@@ -3868,6 +4117,19 @@ C등급은 관찰 등급이며 신규 목돈 매수 가능 등급이 아니다. 
 자동 적립 가능(DCA 유지)과 신규 목돈 매수 가능(buy_grade A/B + risk_reward valid)은 다른 개념이다. 자동 적립이 가능해도 신규 목돈 매수는 금지일 수 있으며, 이 두 개념을 혼용하지 않는다.
 TDE 신규 목돈 매수 A/B 후보가 0개일 경우, 보고서 본문 어디에서도 다음 표현을 절대 사용하지 마라: '신규 매수 가능 여부: 제한적', '신규 매수 제한적', '신규 진입 비중 30% 축소', '조건부 신규 매수', '일부 우량주 가격 조건 대기'. 이 경우 반드시 '신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로만 표현한다.
 가격 조건이 충족되기 전까지 GOOGL(370달러 초과)/FCX(60달러 초과)/VOO(RSI>60+670달러 초과)는 자동 적립만 유지한다. C등급 종목이나 DCA 적립 종목이 있더라도 신규 목돈 매수는 금지이다.
+
+[가격 조건 발동 표현 원칙 — 반드시 준수]
+user_content의 [가격 조건 발동 상태]에 TRIGGERED(이미 발동) 종목이 있을 경우:
+1. 해당 종목에 대해 보고서 본문에서 "이탈 시", "도달 시", "알림 설정"만 사용하지 마라.
+2. TRIGGERED 종목은 반드시 "이미 발동 — 즉시 재검토 필요" 또는 이에 준하는 표현을 사용해야 한다.
+3. TRIGGERED가 곧 자동매도를 의미하지 않는다. 종목별 기존 전략에 따라 표현해라:
+   - 셀트리온제약 46,500원 이탈: "46,500원 기준 이미 이탈 — 회복 전략 훼손, 100~150주 축소 여부 즉시 재검토"
+   - 한미반도체 280,000원 이탈: "280,000원 기준 이미 이탈 — 비중 1% 미만이므로 급매도보다 축소 여부 재검토"
+   - RGTI 22달러 이탈: "22달러 기준 이미 이탈 — 절반 축소 검토"
+   - BEAM 25달러 이탈: "25달러 기준 이미 이탈 — 절반 축소 검토"
+4. NOT_REACHED 또는 NEAR 상태에서만 미래형 표현("이탈 시", "도달 시")을 허용한다.
+5. 실전 매매 실행표에서 TRIGGERED 상태 종목은 오늘 실행 또는 즉시 재검토 칸에 반드시 반영해라.
+6. 보고서 상단 핵심 결론에 TRIGGERED 종목이 하나라도 있으면 "가격 조건 발동 종목 있음"을 명시해라.
 """
 
     static_system = (
@@ -3884,7 +4146,8 @@ TDE 신규 목돈 매수 A/B 후보가 0개일 경우, 보고서 본문 어디�
         f"[전일 추천 검증 데이터 — 자기학습용]\n{yesterdays_verification}\n\n"
         f"[최근 실패/성공 패턴 요약 — 반영규칙 준수]\n{patterns_str or '패턴 데이터 없음'}\n\n"
         f"[실행 완료된 매매 내역]\n{executed_summary}\n\n"
-        f"오늘 날짜: {today}\n"
+        f"[가격 조건 발동 상태 — 반드시 본문에 반영]\n{price_trigger_str or '가격 조건 상태 데이터 없음'}\n\n"
+        f"오늘 날짜: {today} (KST 기준)\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
         f"실시간 환율: {exchange_rate}원/달러\n\n"
         f"[거시경제 지표]\n{_fmt_macro(macro_data)}\n\n"
@@ -4039,8 +4302,8 @@ def _report_text_to_html(text: str) -> str:
 
 
 def send_email(report_content):
-    today = datetime.now().strftime("%Y년 %m월 %d일")
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    today        = _report_date_kst_str()
+    generated_at = _report_timestamp_kst_str()
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📈 투자 분석 보고서 — {today}"
@@ -4172,7 +4435,7 @@ def send_telegram(report_content: str):
         print("  [텔레그램] TELEGRAM_BOT_TOKEN 없음, 발송 스킵", flush=True)
         return
 
-    today  = datetime.now().strftime("%Y년 %m월 %d일")
+    today  = _report_date_kst_str()
     header = f"<b>📈 투자 분석 보고서 — {today}</b>\n"
     body   = _html_to_telegram(report_content)
     chunks = _split_message(header + body)
@@ -4363,11 +4626,39 @@ def run_daily_report():
         print(f"  [TDE] 실행 실패: {_e}", flush=True)
         tde_results = []
 
+    # 가격 조건 발동 판정 (generate_report 전에 실행 — LLM user_content에 전달)
+    _all_stock_pre = {**us_data, **kr_data}
+    try:
+        price_trigger_results = build_price_trigger_table(_all_stock_pre)
+        _triggered = [r for r in price_trigger_results if r["status"] == "TRIGGERED"]
+        _near      = [r for r in price_trigger_results if r["status"] == "NEAR"]
+        print(f"  [PRICE-GATE] 발동 종목: {[r['name'] for r in _triggered]}", flush=True)
+        print(f"  [PRICE-GATE] 근접 종목: {[r['name'] for r in _near]}", flush=True)
+        # user_content에 전달할 문자열 생성
+        _pt_lines = []
+        for _r in price_trigger_results:
+            _s = _r["status"]
+            _emoji = {"TRIGGERED": "🚨 이미 발동", "NEAR": "⚠️ 근접",
+                      "NOT_REACHED": "대기", "UNKNOWN": "데이터 부족"}.get(_s, _s)
+            if _s == "TRIGGERED":
+                _action = _r.get("triggered_action", _r["message"])
+            elif _s == "NEAR":
+                _action = _r.get("near_action", _r["message"])
+            else:
+                _action = _r["message"]
+            _pt_lines.append(f"{_r['name']}({_r['symbol']}): [{_emoji}] {_action}")
+        price_trigger_str = "\n".join(_pt_lines)
+    except Exception as _pte:
+        print(f"  [PRICE-GATE] 판정 실패: {_pte}", flush=True)
+        price_trigger_results = []
+        price_trigger_str = "가격 조건 판정 실패"
+
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
                                       macro_data, fear_greed, insider_trades,
                                       congress_trades, put_call_ratio, portfolio_data,
-                                      news_data, earnings_data, patterns_str)
+                                      news_data, earnings_data, patterns_str,
+                                      price_trigger_str=price_trigger_str)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
 
     # 목표가/손절가 portfolio.json에 자동 저장
@@ -4476,12 +4767,13 @@ def run_daily_report():
     try:
         if isinstance(report, str):
             _tde_list   = tde_results if tde_results else []
+            _ptr        = price_trigger_results if price_trigger_results else []
             tde_section = render_tde_report_section(_tde_list)
-            # LLM/TDE 충돌 감지
-            _conflicts = detect_tde_llm_conflicts(report, _tde_list)
+            # LLM/TDE 충돌 감지 (가격 조건 발동 충돌 포함)
+            _conflicts = detect_tde_llm_conflicts(report, _tde_list, price_trigger_results=_ptr)
             if _conflicts:
                 _conf_lines = [
-                    "", "### ⚠️ TDE/LLM 충돌 검증", "",
+                    "", "⚠️ TDE/LLM 충돌 검증", "",
                     "| 충돌 항목 | 내용 |", "| --- | --- |",
                 ]
                 for _c in _conflicts:
@@ -4491,10 +4783,17 @@ def run_daily_report():
             else:
                 tde_section = (
                     tde_section
-                    + "\n\n### ⚠️ TDE/LLM 충돌 검증\n\n"
+                    + "\n\n⚠️ TDE/LLM 충돌 검증\n\n"
                     + "충돌 없음 — TDE와 LLM 본문 판단이 일치합니다."
                 )
-            report = report + "\n\n" + tde_section
+
+            # 가격 조건 발동 검증표 추가
+            _pt_section = render_price_trigger_section(_ptr)
+            if _pt_section:
+                report = report + "\n\n" + tde_section + "\n\n" + _pt_section
+                print(f"  [PRICE-GATE] 보고서 하단에 가격 조건 발동 검증표 추가 완료", flush=True)
+            else:
+                report = report + "\n\n" + tde_section
             print(f"  [TDE] 보고서 하단에 TDE 섹션 추가 완료 ({len(tde_section)}자)", flush=True)
         else:
             print(f"  [TDE][WARN] report가 문자열이 아님 — TDE 섹션 추가 생략 (type={type(report)})", flush=True)
