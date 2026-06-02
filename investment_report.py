@@ -1995,7 +1995,8 @@ def detect_tde_llm_conflicts(report, tde_results):
     if ab_count == 0:
         _DENY_WORDS_BUY = {"금지", "불가", "없음", "보류", "부적합", "원칙적"}
         _POS_BUY_PATS = [
-            r"신규\s*매수\s*가능",
+            r"신규\s*매수\s*가능",                      # "신규 매수 가능 여부: 제한적" 포함
+            r"신규\s*매수[^\n]{0,20}제한적",            # "신규 매수 가능 여부: 제한적" 변형 대응
             r"제한적\s*매수",
             r"신규\s*매수\s*(?:허용|검토)",
             r"신규\s*진입\s*\d+%\s*축소",
@@ -2027,15 +2028,22 @@ def detect_tde_llm_conflicts(report, tde_results):
         if t["symbol"] in _HIGH_RISK
         and (t["trade_eligibility"]["buy_grade"] == "D" or t["category"] == "유형③")
     }
-    _DENY_WORDS_HR = {"금지", "불가", "보류", "하지"}
-    _POS_HR = ["추매", "추가매수", "추가 매수", "매수 후보"]
+    # 충돌 조건: 종목명 라인 + 금지성 단어 없음 + (매수 후보 존재 OR 추매/추가매수 + 가능/허용/진입)
+    _DENY_WORDS_HR = {"금지", "불가", "보류", "하지", "축소", "매도", "유지", "보유"}
+    _TRIGGER_HR    = ["추매", "추가매수", "추가 매수"]
+    _AFFIRM_HR     = ["가능", "허용", "진입", "추천"]
     for _sym in _hr_d:
         for _line in report.splitlines():
             if _sym not in _line:
                 continue
             if any(_dw in _line for _dw in _DENY_WORDS_HR):
                 continue
-            if any(_pos in _line for _pos in _POS_HR):
+            _has_buy_candidate     = "매수 후보" in _line
+            _has_trigger_with_affirm = (
+                any(_tr in _line for _tr in _TRIGGER_HR)
+                and any(_af in _line for _af in _AFFIRM_HR)
+            )
+            if _has_buy_candidate or _has_trigger_with_affirm:
                 conflicts.append({
                     "type": "고위험 추매 충돌",
                     "detail": f"{_sym}는 TDE D등급(유형③ 고위험)인데 본문에 추매/추가매수 가능 표현이 있습니다.",
@@ -2136,7 +2144,13 @@ def render_tde_report_section(tde_results):
         and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
     ]
     dca_list= [t["name"] for t in tde_results if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
-    d_list  = [t["name"] for t in tde_results if t["trade_eligibility"]["buy_grade"] == "D"]
+    # D 요약: 보유 종목(portfolio_owned=True)이고 DCA 대상이 아닌 종목만 표시
+    d_list  = [
+        t["name"] for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] == "D"
+        and t.get("portfolio_owned", False)
+        and not t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]
+    ]
     d_str   = ", ".join(d_list[:6]) + ("..." if len(d_list) > 6 else "")
 
     lines += [
@@ -3696,6 +3710,8 @@ TDE 실전 매매 판단 엔진 섹션은 코드가 계산한 결과이므로, L
 TDE 기준 신규 목돈 매수 A/B 후보가 0개일 경우, 본문에서 '신규 매수 가능', '제한적 매수', '신규 진입 30% 축소'처럼 실행 가능성을 암시하는 표현을 쓰지 않는다. 이 경우 '신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로 표현한다.
 C등급은 관찰 등급이며 신규 목돈 매수 가능 등급이 아니다. C등급 종목이 있어도 TDE 신규 목돈 매수 A/B 후보 수에 포함하지 않는다.
 자동 적립 가능(DCA 유지)과 신규 목돈 매수 가능(buy_grade A/B + risk_reward valid)은 다른 개념이다. 자동 적립이 가능해도 신규 목돈 매수는 금지일 수 있으며, 이 두 개념을 혼용하지 않는다.
+TDE 신규 목돈 매수 A/B 후보가 0개일 경우, 보고서 본문 어디에서도 다음 표현을 절대 사용하지 마라: '신규 매수 가능 여부: 제한적', '신규 매수 제한적', '신규 진입 비중 30% 축소', '조건부 신규 매수', '일부 우량주 가격 조건 대기'. 이 경우 반드시 '신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로만 표현한다.
+가격 조건이 충족되기 전까지 GOOGL(370달러 초과)/FCX(60달러 초과)/VOO(RSI>60+670달러 초과)는 자동 적립만 유지한다. C등급 종목이나 DCA 적립 종목이 있더라도 신규 목돈 매수는 금지이다.
 """
 
     static_system = (
