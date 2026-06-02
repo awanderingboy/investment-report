@@ -1084,10 +1084,14 @@ def _normalize_action(action_str: str) -> str:
 
 def _classify_stock_type(ticker: str, portfolio_data: dict, current_price=None) -> str:
     HIGH_RISK = {"RGTI", "BEAM", "JOBY", "QBTS", "PWFL"}
+    # 한미반도체는 손실률에 관계없이 항상 유형② 성장스윙으로 고정
+    FORCE_SWING = {"042700.KS"}
     if any(ticker == it.get("ticker") for it in portfolio_data.get("category1", [])):
         return "핵심장기보유"
     if ticker in HIGH_RISK:
         return "고위험옵션"
+    if ticker in FORCE_SWING:
+        return "성장스윙"
     for it in portfolio_data.get("category2", []):
         if it.get("ticker") == ticker and current_price:
             avg = _safe_float(it.get("avg_price"))
@@ -1986,40 +1990,57 @@ def detect_tde_llm_conflicts(report, tde_results):
                 })
                 break
 
-    # 1. 신규 매수 가능 표현 충돌 (A/B 0개인데 매수 가능성 암시)
+    # 1. 신규 매수 가능 표현 충돌 (A/B 0개인데 매수 가능성 암시) — 라인 단위 검사
+    # 같은 라인에 금지/불가/없음/보류/부적합/원칙적 단어가 있으면 충돌 아님
     if ab_count == 0:
-        _buy_pos = [
-            r"신규\s*매수\s*가능\s*여부\s*[:：]\s*(?!불가|금지|없음)",
+        _DENY_WORDS_BUY = {"금지", "불가", "없음", "보류", "부적합", "원칙적"}
+        _POS_BUY_PATS = [
+            r"신규\s*매수\s*가능",
+            r"제한적\s*매수",
+            r"신규\s*매수\s*(?:허용|검토)",
             r"신규\s*진입\s*\d+%\s*축소",
-            r"제한적\s*매수(?!\s*금지|\s*불가)",
-            r"신규\s*매수\s*(?:가능|허용|검토)(?!\s*금지|\s*불가)",
+            r"신규\s*진입\s*가능",
         ]
-        for _pat in _buy_pos:
-            if _re.search(_pat, report):
-                conflicts.append({
-                    "type": "신규 매수 표현 충돌",
-                    "detail": (
-                        "LLM 본문에 신규 매수 가능/제한적 표현이 있지만 "
-                        "TDE 기준 신규 목돈 매수 A/B 후보 0개입니다. "
-                        "'신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로 표현해야 합니다."
-                    ),
-                })
-                break
+        for _line in report.splitlines():
+            if any(_dw in _line for _dw in _DENY_WORDS_BUY):
+                continue
+            for _pat in _POS_BUY_PATS:
+                if _re.search(_pat, _line):
+                    conflicts.append({
+                        "type": "신규 매수 표현 충돌",
+                        "detail": (
+                            "LLM 본문에 신규 매수 가능/제한적 표현이 있지만 "
+                            "TDE 기준 신규 목돈 매수 A/B 후보 0개입니다. "
+                            "'신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로 표현해야 합니다."
+                        ),
+                    })
+                    break
+            else:
+                continue
+            break
 
-    # 2. 고위험 추매 충돌
+    # 2. 고위험 추매 충돌 — 라인 단위 검사
+    # 같은 라인에 금지/불가/보류/하지 단어가 있으면 충돌 아님
     _HIGH_RISK = {"RGTI", "BEAM", "JOBY", "PWFL"}
     _hr_d = {
         t["symbol"] for t in tde_results
         if t["symbol"] in _HIGH_RISK
         and (t["trade_eligibility"]["buy_grade"] == "D" or t["category"] == "유형③")
     }
+    _DENY_WORDS_HR = {"금지", "불가", "보류", "하지"}
+    _POS_HR = ["추매", "추가매수", "추가 매수", "매수 후보"]
     for _sym in _hr_d:
-        _pat = rf"{_sym}[^\n]{{0,30}}(?:추매(?!\s*금지|\s*불가)|추가\s*매수(?!\s*금지|\s*불가)|매수\s*후보(?!\s*없음))"
-        if _re.search(_pat, report):
-            conflicts.append({
-                "type": "고위험 추매 충돌",
-                "detail": f"{_sym}는 TDE D등급(유형③ 고위험)인데 본문에 추매/추가매수 가능 표현이 있습니다.",
-            })
+        for _line in report.splitlines():
+            if _sym not in _line:
+                continue
+            if any(_dw in _line for _dw in _DENY_WORDS_HR):
+                continue
+            if any(_pos in _line for _pos in _POS_HR):
+                conflicts.append({
+                    "type": "고위험 추매 충돌",
+                    "detail": f"{_sym}는 TDE D등급(유형③ 고위험)인데 본문에 추매/추가매수 가능 표현이 있습니다.",
+                })
+                break
 
     # 3. 셀트리온제약 물타기 충돌
     _celltrion_d = any(
@@ -2053,6 +2074,41 @@ def detect_tde_llm_conflicts(report, tde_results):
                     break
 
     return conflicts
+
+
+def _short_tde_reason(tde_item):
+    """TDE 항목에서 표 출력용 짧은 이유 문자열을 생성한다 (60자 이내)."""
+    import re as _re2
+    sym = tde_item["symbol"]
+    cat = tde_item["category"]
+    ds  = tde_item["data_status"]
+    te  = tde_item["trade_eligibility"]
+
+    if not ds["price_collected"]:
+        return "현재가 미수집 — 매매 금지"
+
+    raw_reasons = " ".join(te.get("reason", []))
+
+    if sym == "GOOGL" and "370달러" in raw_reasons:
+        return "370달러 초과 — 자동 적립만 유지"
+    if sym == "FCX" and "60달러" in raw_reasons:
+        return "60달러 초과 — 자동 적립만 유지"
+    if sym == "VOO" and ("과열" in raw_reasons or "670달러" in raw_reasons):
+        m = _re2.search(r"RSI\s*([\d.]+)", raw_reasons)
+        rsi_str = m.group(1) if m else "?"
+        return f"RSI {rsi_str} 과열 — 자동 적립만 유지"
+
+    if cat == "유형④":
+        return "유형④ 회복관리 — 물타기 금지"
+    if cat == "유형③":
+        return "유형③ 고위험 — 신규/추매 금지"
+    if cat == "유형②":
+        return "소액 스윙 — 비중 확대 금지"
+
+    if te.get("reason"):
+        r = te["reason"][0]
+        return r[:50] if len(r) <= 50 else r[:47] + "..."
+    return "-"
 
 
 # ── TDE 보고서 섹션 렌더러 ─────────────────────────────────────────────────────
@@ -2155,7 +2211,7 @@ def render_tde_report_section(tde_results):
             te   = t["trade_eligibility"]
             bt   = te["buy_type"]
             lump = "가능" if bt["lump_sum_buy_allowed"] else "금지"
-            r0   = te["reason"][0][:50] if te["reason"] else "-"
+            r0   = _short_tde_reason(t)
             lines.append(f"| {t['name']}({t['symbol']}) | 유지 가능 | {lump} | {r0} |")
         lines.append("")
     else:
@@ -2185,11 +2241,13 @@ def render_tde_report_section(tde_results):
                 action = "신규/추매 금지"
             elif cat == "유형④":
                 action = "물타기 금지"
+            elif cat == "유형②":
+                action = "비중 확대 금지"
             elif cat == "유형①":
                 action = "목돈 추격매수 금지"
             else:
                 action = "신규 매수 금지"
-            r0 = t["trade_eligibility"]["reason"][0][:50] if t["trade_eligibility"]["reason"] else "-"
+            r0 = _short_tde_reason(t)
             lines.append(f"| {t['name']}({t['symbol']}) | {action} | {r0} |")
         lines.append("")
 
