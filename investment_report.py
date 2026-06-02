@@ -1788,6 +1788,29 @@ def build_trade_decision_engine(
             buy_grade  = "D"
 
         else:
+            # ── 유형① 신규 목돈 매수 가격 게이트 ────────────────────────────
+            # 자동 적립은 유지하되, 신규 목돈 매수 B+ 는 가격 조건 필요
+            _price_gate_blocks_lump = False
+            if ticker == "GOOGL" and current_price is not None and current_price > 370.0:
+                _price_gate_blocks_lump = True
+                reason.append(
+                    f"GOOGL 현재가 {current_price:.2f}달러 > 370달러 — "
+                    f"신규 목돈 매수 B등급 불가, 자동 적립만 유지"
+                )
+            elif ticker == "FCX" and current_price is not None and current_price > 60.0:
+                _price_gate_blocks_lump = True
+                reason.append(
+                    f"FCX 현재가 {current_price:.2f}달러 > 60달러 — "
+                    f"신규 목돈 매수 B등급 불가, 자동 적립만 유지"
+                )
+            elif ticker == "VOO" and current_price is not None:
+                if not (rsi is None or rsi <= 60.0 or current_price <= 670.0):
+                    _price_gate_blocks_lump = True
+                    reason.append(
+                        f"VOO 현재가 {current_price:.2f}달러 > 670달러이고 "
+                        f"RSI {rsi:.1f} > 60 — 신규 목돈 매수 B등급 불가, 자동 적립만 유지"
+                    )
+
             # ── A 조건 평가 ─────────────────────────────────────────────────
             a_ok = (
                 data_quality in ("A", "B")
@@ -1803,6 +1826,7 @@ def build_trade_decision_engine(
                 and (gain_pct is not None and gain_pct >= 8.0)
                 and (loss_pct is not None and abs(loss_pct) <= 7.0)
                 and not rsi_blocks_lump
+                and not _price_gate_blocks_lump
                 and category != "유형③"
             )
 
@@ -1819,6 +1843,7 @@ def build_trade_decision_engine(
                 and (not high_risk_exceeded or category == "유형①")
                 and category != "유형③"
                 and not rsi_blocks_lump
+                and not _price_gate_blocks_lump
             )
 
             if a_ok:
@@ -1930,6 +1955,36 @@ def detect_tde_llm_conflicts(report, tde_results):
         1 for t in tde_results
         if t["trade_eligibility"]["buy_grade"] in ("A", "B")
     )
+    # 실제 실행 가능한 A/B: rr_valid=True AND lump_sum_buy_allowed=True
+    _valid_lump_ab_count = sum(
+        1 for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+        and t["risk_reward"]["valid"]
+        and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
+    )
+
+    # 0. 역방향 충돌 (LLM: 신규 매수 불가 / TDE: 실행 가능 후보 존재)
+    if _valid_lump_ab_count > 0:
+        _no_buy_pats = [
+            r"신규\s*매수\s*[:\s]\s*D",
+            r"신규\s*매수\s*불가",
+            r"신규\s*매수\s*실행표\s*없음",
+            r"B등급\s*이상\s*종목\s*없음",
+            r"B등급\s*이상\s*종목\s*0개",
+            r"수익형\s*모드\s*OFF",
+            r"신규\s*매수\s*금지",
+        ]
+        for _pat in _no_buy_pats:
+            if _re.search(_pat, report):
+                conflicts.append({
+                    "type": "역방향 충돌 (LLM 불가 ↔ TDE 후보 존재)",
+                    "detail": (
+                        f"LLM 본문은 신규 매수 불가/실행표 없음으로 판단했지만 "
+                        f"TDE 기준 실행 가능 A/B 후보 {_valid_lump_ab_count}개가 존재합니다. "
+                        f"TDE buy_grade 또는 본문 판단 중 하나를 수정해야 합니다."
+                    ),
+                })
+                break
 
     # 1. 신규 매수 가능 표현 충돌 (A/B 0개인데 매수 가능성 암시)
     if ab_count == 0:
@@ -2017,7 +2072,13 @@ def render_tde_report_section(tde_results):
     # ── 1. TDE 요약 ───────────────────────────────────────────────────────────
     total   = len(tde_results)
     passed  = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
-    ab_list = [t["name"] for t in tde_results if t["trade_eligibility"]["buy_grade"] in ("A", "B")]
+    # A/B 후보 = 실제 신규 목돈 매수 실행 가능 기준 (rr_valid=True, lump_sum=True)
+    ab_list = [
+        t["name"] for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+        and t["risk_reward"]["valid"]
+        and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
+    ]
     dca_list= [t["name"] for t in tde_results if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
     d_list  = [t["name"] for t in tde_results if t["trade_eligibility"]["buy_grade"] == "D"]
     d_str   = ", ".join(d_list[:6]) + ("..." if len(d_list) > 6 else "")
@@ -2035,12 +2096,18 @@ def render_tde_report_section(tde_results):
     # ── 2. 신규 매수 실행표 ───────────────────────────────────────────────────
     lines += ["신규 매수 실행표", ""]
 
-    valid_ab   = [t for t in tde_results
-                  if t["trade_eligibility"]["buy_grade"] in ("A", "B")
-                  and t["risk_reward"]["valid"]]
-    invalid_ab = [t for t in tde_results
-                  if t["trade_eligibility"]["buy_grade"] in ("A", "B")
-                  and not t["risk_reward"]["valid"]]
+    valid_ab   = [
+        t for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+        and t["risk_reward"]["valid"]
+        and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
+    ]
+    invalid_ab = [
+        t for t in tde_results
+        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+        and not (t["risk_reward"]["valid"]
+                 and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"])
+    ]
 
     if valid_ab:
         lines += [
@@ -2129,11 +2196,11 @@ def render_tde_report_section(tde_results):
     # ── 5. 오늘 실제 주문 가능 여부 ─────────────────────────────────────────
     if valid_ab:
         lines.append(
-            "오늘 실제 신규 매수 후보 있음 — "
-            "단, 3단계에서는 주문 수량 자동 계산 전이므로 4단계 전까지 수동 검토 필요"
+            "오늘 실제 신규 목돈 매수 후보 있음 — "
+            "단, 주문 수량/금액 자동 계산 전이므로 수동 검토 필요"
         )
     else:
-        lines.append("오늘 실제 신규 매수 주문 없음")
+        lines.append("오늘 실제 신규 목돈 매수 주문 없음")
     lines.append("")
 
     return "\n".join(lines)
@@ -3569,6 +3636,8 @@ PLTR은 RGTI와 같은 "손실 제한 감시" 종목이 아니다. PLTR은 유�
 [TDE 실전 매매 판단 엔진 우선 원칙]
 TDE 실전 매매 판단 엔진 섹션은 코드가 계산한 결과이므로, LLM 본문 판단보다 우선한다. LLM은 TDE의 buy_grade, 자동 적립 가능 여부, 신규 목돈 매수 금지 판단을 임의로 상향하거나 덮어쓰지 않는다.
 TDE 기준 신규 목돈 매수 A/B 후보가 0개일 경우, 본문에서 '신규 매수 가능', '제한적 매수', '신규 진입 30% 축소'처럼 실행 가능성을 암시하는 표현을 쓰지 않는다. 이 경우 '신규 목돈 매수 금지, 기존 자동 적립만 유지 가능'으로 표현한다.
+C등급은 관찰 등급이며 신규 목돈 매수 가능 등급이 아니다. C등급 종목이 있어도 TDE 신규 목돈 매수 A/B 후보 수에 포함하지 않는다.
+자동 적립 가능(DCA 유지)과 신규 목돈 매수 가능(buy_grade A/B + risk_reward valid)은 다른 개념이다. 자동 적립이 가능해도 신규 목돈 매수는 금지일 수 있으며, 이 두 개념을 혼용하지 않는다.
 """
 
     static_system = (
