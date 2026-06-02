@@ -155,8 +155,8 @@ def update_dca_portfolio(portfolio_data: dict, us_data: dict, exchange_rate: flo
 
 
 # ── 중복 발송 방지 (Send Guard) ───────────────────────────────────────────────
-# NOTE: GitHub Actions fresh runner에서는 파일 상태가 보존되지 않으므로
-# 외부 cron 중복 방지를 완전히 보장하려면 Gmail 검색 또는 원격 상태 저장이 필요하다.
+# 1단계: .sent_reports.json (로컬, GitHub Actions fresh runner에서 상태 미보존)
+# 2단계: Gmail IMAP 검색 (원격 상태 — runner 재시작 후에도 유효)
 
 def _today_kst() -> str:
     """KST 기준 오늘 날짜 문자열 반환 (YYYY-MM-DD)."""
@@ -191,6 +191,71 @@ def mark_sent_today(report_type: str = "daily") -> None:
     data = _load_sent_reports()
     data[_today_kst()] = {"sent_at": sent_at, "report_type": report_type, "status": "sent"}
     _save_sent_reports(data)
+
+# ── Gmail IMAP 중복 체크 ──────────────────────────────────────────────────────
+
+def _today_report_subject_kst() -> str:
+    """KST 기준 오늘 날짜로 이메일 제목 키워드 반환."""
+    from datetime import timezone, timedelta as _td
+    kst = timezone(_td(hours=9))
+    today_str = datetime.now(tz=kst).strftime("%Y년 %m월 %d일")
+    return f"투자 분석 보고서 — {today_str}"
+
+def _imap_date_kst() -> str:
+    """IMAP SINCE 쿼리용 날짜 문자열 반환 (DD-Mon-YYYY)."""
+    from datetime import timezone, timedelta as _td
+    import calendar
+    kst = timezone(_td(hours=9))
+    now = datetime.now(tz=kst)
+    mon = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][now.month - 1]
+    return f"{now.day:02d}-{mon}-{now.year}"
+
+def _imap_search_mailbox_for_subject(imap, mailbox: str, subject: str) -> bool:
+    """지정 mailbox에서 subject가 포함된 오늘 메일을 검색한다. 실패 시 False."""
+    import imaplib
+    try:
+        status, _ = imap.select(mailbox, readonly=True)
+        if status != "OK":
+            print(f"  [SEND-GUARD][WARN] mailbox 선택 실패: {mailbox}", flush=True)
+            return False
+        since = _imap_date_kst()
+        # UTF-8 제목 검색: Gmail IMAP은 SUBJECT 리터럴 검색을 지원
+        _, data = imap.search(None, "CHARSET", "UTF-8",
+                              "SINCE", since,
+                              "SUBJECT", subject)
+        return bool(data and data[0] and data[0].split())
+    except Exception as e:
+        print(f"  [SEND-GUARD][WARN] mailbox={mailbox} 검색 실패: {e}", flush=True)
+        return False
+
+def gmail_report_exists_today(report_type: str = "daily") -> bool:
+    """
+    Gmail IMAP으로 오늘 보고서가 이미 발송됐는지 확인한다.
+    FORCE_SEND_REPORT=true이면 체크를 우회해 False를 반환한다.
+    IMAP 연결/검색 실패 시 False를 반환해 발송을 허용한다.
+    """
+    import imaplib
+    if os.environ.get("FORCE_SEND_REPORT", "").lower() == "true":
+        return False
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        print("  [SEND-GUARD][WARN] Gmail 자격증명 없음 — IMAP 중복 체크 스킵", flush=True)
+        return False
+
+    subject = _today_report_subject_kst()
+    # 검색할 mailbox 후보 (INBOX 우선, Sent 순서)
+    mailboxes = ["INBOX", "[Gmail]/Sent Mail", '"[Gmail]/Sent Mail"', "[Gmail]/보낸편지함"]
+    try:
+        imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        for mb in mailboxes:
+            if _imap_search_mailbox_for_subject(imap, mb, subject):
+                imap.logout()
+                return True
+        imap.logout()
+        return False
+    except Exception as e:
+        print(f"  [SEND-GUARD][WARN] Gmail duplicate check failed — allow send: {e}", flush=True)
+        return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4391,8 +4456,13 @@ def run_daily_report():
         print(f"  [TDE][WARN] TDE 섹션 추가 실패: {_te}", flush=True)
 
     print(f"\n이메일 발송", flush=True)
-    if already_sent_today("daily"):
+    _force = os.environ.get("FORCE_SEND_REPORT", "").lower() == "true"
+    if _force:
+        print("  [SEND-GUARD] FORCE_SEND_REPORT=true — duplicate checks bypassed", flush=True)
+    if not _force and already_sent_today("daily"):
         print("  [SEND-GUARD] already sent today — skip email", flush=True)
+    elif not _force and gmail_report_exists_today("daily"):
+        print("  [SEND-GUARD] Gmail already has today's report — skip email", flush=True)
     else:
         send_email(report)
         mark_sent_today("daily")
