@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '13 22 * * *'  # UTC 22:13 = KST 07:13
   workflow_dispatch:       # GitHub UI에서 수동 실행 가능
+    inputs:
+      force_send:
+        description: 'Force send report, bypass duplicate guard'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-report:
@@ -30,4 +36,5 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_SEND_REPORT: ${{ github.event.inputs.force_send || 'false' }}
         run: python investment_report.py
