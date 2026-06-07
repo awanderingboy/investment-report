@@ -60,6 +60,35 @@ KR_WATCHLIST_FALLBACK = [
 CANDIDATE_TYPES = ["안정형", "추세형", "이벤트형", "현금대체형", "보유추가형", "고위험", "제외"]
 GRADE_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3, "EXCLUDE": 4}
 
+# ── Cache ──────────────────────────────────────────────────────────────────────
+
+def _cache_path() -> str:
+    today = datetime.date.today().strftime("%Y%m%d")
+    return os.path.join(OUTPUTS_DIR, f"ticker_cache_{today}.json")
+
+
+def _load_cache() -> dict:
+    path = _cache_path()
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    if not cache:
+        return
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    try:
+        with open(_cache_path(), "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 # ── Universe Loading ───────────────────────────────────────────────────────────
 
 def _scrape_sp500_wikipedia():
@@ -132,7 +161,6 @@ def load_market_universe(market: str) -> dict:
             source = "Wikipedia S&P500+NASDAQ100 scrape"
         elif len(combined) >= 50:
             status = "partial"
-            fallback_set = set(US_WATCHLIST_FALLBACK)
             combined = list(dict.fromkeys(combined + [t for t in US_WATCHLIST_FALLBACK if t not in set(combined)]))
             source = "Wikipedia partial + fallback supplement"
         else:
@@ -185,8 +213,12 @@ def load_market_universe(market: str) -> dict:
 
 # ── Data Collection ────────────────────────────────────────────────────────────
 
-def _fetch_ticker_data(ticker: str, period: str = "3mo"):
+def _fetch_ticker_data(ticker: str, period: str = "3mo", cache: dict = None):
     """Fetch basic price/volume/info data for one ticker. Returns None on failure."""
+    cache_key = f"{ticker}:{period}"
+    if cache is not None and cache_key in cache:
+        return dict(cache[cache_key])
+
     if not YFINANCE_OK:
         return None
     try:
@@ -231,7 +263,7 @@ def _fetch_ticker_data(ticker: str, period: str = "3mo"):
         week52_low = info.get("fiftyTwoWeekLow") or float(close_series.min())
         dist_from_52w_high = (current_price - week52_high) / week52_high * 100 if week52_high else 0.0
 
-        return {
+        result = {
             "ticker": ticker,
             "name": short_name,
             "currency": currency,
@@ -256,6 +288,11 @@ def _fetch_ticker_data(ticker: str, period: str = "3mo"):
             "data_source": "yfinance",
             "data_date": hist.index[-1].strftime("%Y-%m-%d"),
         }
+
+        if cache is not None:
+            cache[cache_key] = result
+
+        return result
     except Exception:
         return None
 
@@ -628,11 +665,16 @@ def build_trade_plan(candidate: dict) -> dict:
 
 # ── Dynamic Pool Builder ───────────────────────────────────────────────────────
 
-def build_dynamic_candidate_pool(market_universe: dict, max_pool: int = 300) -> list:
+def build_dynamic_candidate_pool(
+    market_universe: dict,
+    max_pool: int = 300,
+    cache: dict = None,
+    deadline: float = None,
+) -> tuple:
     """
     Fetch data for tickers in market_universe and build raw candidate pool.
     Applies basic filters before scoring.
-    Returns list of raw candidate dicts (unsorted).
+    Returns (candidates, timeout_count, cache_hits).
     """
     tickers = market_universe["tickers"][:max_pool]
     market = market_universe["market"]
@@ -640,14 +682,31 @@ def build_dynamic_candidate_pool(market_universe: dict, max_pool: int = 300) -> 
     dynamic_pool_flag = scan_status == "success"
 
     candidates = []
+    timeout_count = 0
+    cache_hits = 0
     print(f"  [{market}] Fetching {len(tickers)} tickers (scan_status={scan_status})...", flush=True)
 
     for i, ticker in enumerate(tickers):
+        # Timeout guard: stop fetching new tickers if deadline exceeded
+        if deadline is not None and time.time() > deadline:
+            remaining = len(tickers) - i
+            timeout_count += remaining
+            print(f"    [TIMEOUT] 시간 초과 — 남은 {remaining}개 ticker 생략", flush=True)
+            break
+
         if ticker in _EXCLUDE_FROM_NEW:
             continue
-        data = _fetch_ticker_data(ticker)
+
+        cache_key = f"{ticker}:3mo"
+        was_cached = cache is not None and cache_key in cache
+
+        data = _fetch_ticker_data(ticker, cache=cache)
         if data is None:
             continue
+
+        if was_cached:
+            cache_hits += 1
+
         data["market"] = market
         data["dynamic_pool"] = dynamic_pool_flag
 
@@ -672,10 +731,16 @@ def build_dynamic_candidate_pool(market_universe: dict, max_pool: int = 300) -> 
         candidates.append(data)
 
         if (i + 1) % 50 == 0:
-            print(f"    ... {i+1}/{len(tickers)} processed, {len(candidates)} candidates so far", flush=True)
-        time.sleep(0.05)  # rate limit courtesy
+            elapsed_msg = ""
+            if deadline is not None:
+                remaining_s = max(0, deadline - time.time())
+                elapsed_msg = f", {remaining_s:.0f}s remaining"
+            print(f"    ... {i+1}/{len(tickers)} processed, {len(candidates)} candidates so far{elapsed_msg}", flush=True)
 
-    return candidates
+        if not was_cached:
+            time.sleep(0.05)  # rate limit courtesy (skip for cached)
+
+    return candidates, timeout_count, cache_hits
 
 
 # ── Top Candidate Selector ─────────────────────────────────────────────────────
@@ -769,7 +834,15 @@ def save_top_candidates_json(top_candidates: list[dict], market_scan_status: str
 
 # ── Main Screening Flow ────────────────────────────────────────────────────────
 
-def run_screening(markets: list[str] = None, max_pool: int = 300, dry_run: bool = False) -> dict:
+def run_screening(
+    markets: list[str] = None,
+    max_pool: int = 300,
+    dry_run: bool = False,
+    max_us_tickers: int = None,
+    max_kr_tickers: int = None,
+    timeout_seconds: int = 480,
+    use_cache: bool = True,
+) -> dict:
     """
     Full screening pipeline.
     Returns result dict with top_candidates and metadata.
@@ -777,8 +850,20 @@ def run_screening(markets: list[str] = None, max_pool: int = 300, dry_run: bool 
     if markets is None:
         markets = ["US", "KR"]
 
+    start_time = time.time()
+    deadline = (start_time + timeout_seconds) if timeout_seconds > 0 else None
+
+    # Per-market pool sizes (new params take priority over legacy max_pool)
+    _us_max = max_us_tickers if max_us_tickers is not None else max_pool
+    _kr_max = max_kr_tickers if max_kr_tickers is not None else max_pool
+
+    cache = _load_cache() if use_cache else {}
+    initial_cache_size = len(cache)
+
     all_candidates = []
     combined_scan_status = "success"
+    total_timeout_count = 0
+    total_cache_hits = 0
     meta = {"markets": markets, "universes": {}}
 
     for market in markets:
@@ -799,15 +884,27 @@ def run_screening(markets: list[str] = None, max_pool: int = 300, dry_run: bool 
         elif universe["market_scan_status"] == "partial" and combined_scan_status == "success":
             combined_scan_status = "partial"
 
-        print(f"  Universe: {universe['count']} tickers (status={universe['market_scan_status']})", flush=True)
+        per_market_max = _us_max if market == "US" else _kr_max
+        print(f"  Universe: {universe['count']} tickers (status={universe['market_scan_status']}, limit={per_market_max})", flush=True)
 
         if not dry_run:
-            raw_pool = build_dynamic_candidate_pool(universe, max_pool=max_pool)
+            raw_pool, tc, ch = build_dynamic_candidate_pool(
+                universe,
+                max_pool=per_market_max,
+                cache=cache,
+                deadline=deadline,
+            )
+            total_timeout_count += tc
+            total_cache_hits += ch
             print(f"  [SCORE] Scoring {len(raw_pool)} raw candidates...", flush=True)
             scored = [score_candidate(build_trade_plan(c)) for c in raw_pool]
             all_candidates.extend(scored)
         else:
             print(f"  [DRY RUN] Skipping data fetch.", flush=True)
+
+    # Persist updated cache
+    if use_cache and not dry_run:
+        _save_cache(cache)
 
     # Check fallback-only warning
     all_fallback = all(
@@ -826,6 +923,15 @@ def run_screening(markets: list[str] = None, max_pool: int = 300, dry_run: bool 
     if len(top) == 0:
         print("  [WARNING] top_candidates 비어있음 — 스크리닝 조건 재검토 필요", flush=True)
 
+    elapsed = round(time.time() - start_time, 1)
+    cache_used = total_cache_hits
+    new_cache_entries = len(cache) - initial_cache_size
+
+    meta["elapsed_seconds"] = elapsed
+    meta["timeout_count"] = total_timeout_count
+    meta["cache_used"] = cache_used
+    meta["cache_new_entries"] = new_cache_entries
+
     if not dry_run:
         out_path = save_top_candidates_json(top, combined_scan_status, meta)
         print(f"\n[SAVE] {out_path}", flush=True)
@@ -837,6 +943,9 @@ def run_screening(markets: list[str] = None, max_pool: int = 300, dry_run: bool 
         "market_scan_status": combined_scan_status,
         "meta": meta,
         "output_path": out_path,
+        "elapsed_seconds": elapsed,
+        "timeout_count": total_timeout_count,
+        "cache_used": cache_used,
     }
 
 
@@ -1083,29 +1192,59 @@ def _run_mock_tests() -> bool:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
+    t0 = time.time()
     parser = argparse.ArgumentParser(description="candidate_screener — dynamic market screener")
     parser.add_argument("--mock-test", action="store_true", help="Run mock tests (T1–T15)")
     parser.add_argument("--markets", nargs="+", default=["US", "KR"],
                         help="Markets to scan (default: US KR)")
     parser.add_argument("--max-pool", type=int, default=300,
-                        help="Max tickers to fetch per market (default: 300)")
+                        help="Max tickers per market (legacy, default: 300)")
+    parser.add_argument("--max-us-tickers", type=int, default=None,
+                        help="Max US tickers to fetch (overrides --max-pool for US)")
+    parser.add_argument("--max-kr-tickers", type=int, default=None,
+                        help="Max KR tickers to fetch (overrides --max-pool for KR)")
+    parser.add_argument("--fast", action="store_true",
+                        help="Quick run: US=50 tickers, KR=20 tickers")
+    parser.add_argument("--timeout-seconds", type=int, default=480,
+                        help="Global timeout for data fetching in seconds (default: 480)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable ticker data cache")
     parser.add_argument("--dry-run", action="store_true",
                         help="Load universe only, skip data fetch")
     args = parser.parse_args()
 
     if args.mock_test:
         ok = _run_mock_tests()
+        elapsed = time.time() - t0
+        print(f"\n[DONE] candidate_screener completed in {elapsed:.1f}s")
         sys.exit(0 if ok else 1)
+
+    # Resolve per-market limits
+    if args.fast:
+        max_us = 50
+        max_kr = 20
+    else:
+        max_us = args.max_us_tickers if args.max_us_tickers is not None else args.max_pool
+        max_kr = args.max_kr_tickers if args.max_kr_tickers is not None else min(args.max_pool, 50)
 
     result = run_screening(
         markets=[m.upper() for m in args.markets],
         max_pool=args.max_pool,
         dry_run=args.dry_run,
+        max_us_tickers=max_us,
+        max_kr_tickers=max_kr,
+        timeout_seconds=args.timeout_seconds,
+        use_cache=not args.no_cache,
     )
+
+    elapsed = time.time() - t0
 
     print(f"\n=== 스크리닝 완료 ===")
     print(f"market_scan_status : {result['market_scan_status']}")
     print(f"top_candidates     : {len(result['top_candidates'])}개")
+    print(f"elapsed_seconds    : {result.get('elapsed_seconds', round(elapsed, 1))}s")
+    print(f"timeout_count      : {result.get('timeout_count', 0)}")
+    print(f"cache_used         : {result.get('cache_used', 0)}")
     if result.get("output_path"):
         print(f"output             : {result['output_path']}")
 
@@ -1120,6 +1259,8 @@ def main():
                 f"price={c.get('current_price',0):.2f} "
                 f"RR={tp.get('risk_reward_ratio', c.get('risk_reward_ratio', 0)):.2f}"
             )
+
+    print(f"\n[DONE] candidate_screener completed in {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
