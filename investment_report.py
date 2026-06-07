@@ -177,6 +177,74 @@ def _report_timestamp_kst_str() -> str:
     """KST 기준 현재 시각 보고서 표시용 문자열. 예: 2026-06-03 07:17 KST"""
     return _now_kst().strftime("%Y-%m-%d %H:%M KST")
 
+def get_market_data_label(market: str, data_date_str: str, now_kst) -> str:
+    """주말/휴장일 여부에 따라 적절한 데이터 기준일 레이블을 반환한다."""
+    import calendar as _cal
+    _US_HOLIDAYS = {  # NYSE 주요 휴장일 (월-일 기준 간략 목록)
+        (1, 1), (7, 4), (12, 25), (11, 11), (5, 30),
+    }
+    try:
+        from datetime import datetime as _dt2
+        _d = _dt2.strptime(data_date_str, "%Y-%m-%d")
+        _weekday = _d.weekday()  # 0=월 … 6=일
+        _is_weekend = _weekday >= 5
+        _md = (_d.month, _d.day)
+        _is_holiday = _md in _US_HOLIDAYS
+    except Exception:
+        _is_weekend = False
+        _is_holiday = False
+
+    if market.upper() in ("US", "USD", "미국"):
+        if _is_weekend or _is_holiday:
+            return f"미국 주식: 최근 정규장 종가 기준 — {data_date_str}"
+        return f"미국 주식: 정규장 종가/장중 데이터 — {data_date_str} 기준"
+    if market.upper() in ("KR", "KRW", "한국"):
+        if _is_weekend or _is_holiday:
+            return f"한국 주식: 최근 정규장 종가 기준 — {data_date_str}"
+        return f"한국 주식: 전일 종가 기준 — {data_date_str}"
+    return f"{market}: 최근 정규장 종가 기준 — {data_date_str}"
+
+
+def validate_candidate_metrics(candidate: dict) -> tuple:
+    """신규 수익 발굴 후보의 핵심 수치를 검증한다.
+
+    candidate 예시:
+      {"name": "AVGO", "current_price": 200.0, "stop_price": 180.0,
+       "target_price": 240.0, "rr": 2.0, "data_source_count": 2}
+
+    반환: (is_valid: bool, issues: list[str])
+    """
+    issues = []
+    cp  = candidate.get("current_price")
+    sp  = candidate.get("stop_price")
+    tp  = candidate.get("target_price")
+    rr  = candidate.get("rr")
+    src = candidate.get("data_source_count", 2)
+
+    if cp is None or cp <= 0:
+        issues.append("현재가 미수집 — 후보 제외")
+    if sp is not None and cp is not None and sp >= cp:
+        issues.append("손절가 >= 현재가 — A/B 후보 금지")
+    if tp is not None and cp is not None and tp <= cp:
+        issues.append("목표가 <= 현재가 — A/B 후보 금지")
+    if rr is None:
+        issues.append("RR 계산 불가 — A/B 후보 금지")
+    elif rr < 1.5:
+        issues.append(f"RR {rr:.2f} < 1.5 — A/B 후보 부적합")
+    if src <= 1:
+        issues.append("단일 소스 — C 관찰만 허용, A/B 금지")
+
+    # 비정상 가격 변동 탐지
+    chg_1m = candidate.get("chg_1m")  # 1개월 등락률 (%)
+    chg_6m = candidate.get("chg_6m")  # 6개월 등락률 (%)
+    if chg_1m is not None and abs(chg_1m) > 50:
+        issues.append(f"1개월 변동 {chg_1m:+.0f}% — 교차검증 필요")
+    if chg_6m is not None and chg_6m > 100:
+        issues.append(f"6개월 수익률 {chg_6m:+.0f}% — 강한 추세 또는 교차검증 필요")
+
+    return (len(issues) == 0, issues)
+
+
 def _load_sent_reports() -> dict:
     try:
         with open(SENT_REPORTS_FILE, "r", encoding="utf-8") as f:
@@ -2222,20 +2290,38 @@ def detect_tde_llm_conflicts(report, tde_results, price_trigger_results=None):
                 })
                 break
 
-    # 3. 셀트리온제약 물타기 충돌
+    # 3. 셀트리온제약 물타기 충돌 — 블록 전체 문맥 판단
     _celltrion_d = any(
         t["symbol"] == "068760.KS" and t["category"] == "유형④"
         for t in tde_results
     )
     if _celltrion_d:
-        for _cn in ["셀트리온제약", "셀트리온 제약", "068760"]:
-            _pat = rf"{_cn}[^\n]{{0,20}}(?:추매|물타기|추가\s*매수)(?!\s*금지|\s*불가)"
-            if _re.search(_pat, report):
+        _ct_search_keys = ["셀트리온제약", "셀트리온 제약", "068760"]
+        _ct_lines = [
+            _line for _line in report.splitlines()
+            if any(_k in _line for _k in _ct_search_keys)
+        ]
+        if _ct_lines:
+            _ct_block = "\n".join(_ct_lines)
+            # 매수/물타기 긍정 신호 (이 표현이 블록에 있을 때만 검사)
+            _ct_buy_pos = [
+                "추매 가능", "물타기 가능", "추가매수 추천", "비중 확대",
+                "하락 시 매수", "저점 매수", "분할매수", "신규 매수",
+            ]
+            # 방어/금지 표현 (하나라도 있으면 충돌 아님)
+            _ct_deny = [
+                "금지", "하지 말 것", "추매 금지", "물타기 금지",
+                "신규 매수 금지", "축소", "리스크 재검토", "회복 전략 훼손",
+                "전량 매도 금지", "반등 시 축소", "보유하되", "매수 금지",
+                "추가매수 금지",
+            ]
+            _ct_has_pos  = any(_bp in _ct_block for _bp in _ct_buy_pos)
+            _ct_has_deny = any(_bd in _ct_block for _bd in _ct_deny)
+            if _ct_has_pos and not _ct_has_deny:
                 conflicts.append({
                     "type": "셀트리온제약 물타기 충돌",
-                    "detail": "셀트리온제약은 TDE 유형④(회복탈출관리)인데 본문에 추매/물타기 가능 표현이 있습니다.",
+                    "detail": "셀트리온제약은 TDE 유형④(회복탈출관리)인데 본문에 추매/물타기 가능 표현이 있고 금지 표현이 없습니다.",
                 })
-                break
 
     # 4. A/B 0개인데 오늘 주문 실행 가능 표현
     if ab_count == 0:
@@ -2524,59 +2610,25 @@ def render_price_trigger_section(trigger_results: list) -> str:
     return "\n".join(lines)
 
 
-# ── TDE 보고서 섹션 렌더러 ─────────────────────────────────────────────────────
+# ── TDE 보고서 섹션 렌더러 (검증 요약) ──────────────────────────────────────────
 def render_tde_report_section(tde_results):
-    """
-    TDE 결과를 보고서 본문에 붙일 deterministic section으로 변환한다.
-    LLM이 아닌 코드가 직접 생성한다.
-    """
+    """TDE 결과를 '🔍 TDE 최종 검증 요약' 축약 섹션으로 변환한다."""
     if not tde_results:
         return (
-            "## 🧠 TDE 실전 매매 판단 엔진\n\n"
+            "🔍 TDE 최종 검증 요약\n\n"
             "TDE 결과 없음 — 데이터 구조 확인 필요"
         )
 
-    lines = ["## 🧠 TDE 실전 매매 판단 엔진", ""]
-
-    # ── 1. TDE 요약 ───────────────────────────────────────────────────────────
     total   = len(tde_results)
     passed  = sum(1 for t in tde_results if t["data_status"]["data_quality"] in ("A", "B", "C"))
-    # A/B 후보 = 실제 신규 목돈 매수 실행 가능 기준 (rr_valid=True, lump_sum=True)
     ab_list = [
         t["name"] for t in tde_results
         if t["trade_eligibility"]["buy_grade"] in ("A", "B")
         and t["risk_reward"]["valid"]
         and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
     ]
-    dca_list= [t["name"] for t in tde_results if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
-    # D 요약: 보유 종목(portfolio_owned=True)이고 DCA 대상이 아닌 종목만 표시
-    d_list  = [
-        t["name"] for t in tde_results
-        if t["trade_eligibility"]["buy_grade"] == "D"
-        and t.get("portfolio_owned", False)
-        and not t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]
-    ]
-    d_str   = ", ".join(d_list[:6]) + ("..." if len(d_list) > 6 else "")
-
-    lines += [
-        "| 항목 | 결과 |",
-        "| --- | --- |",
-        f"| 실시간 데이터 검증 통과 | {passed}개 / {total}개 |",
-        f"| 신규 목돈 매수 A/B 후보 | {len(ab_list)}개 |",
-        f"| 자동 적립 유지 가능 | {', '.join(dca_list) if dca_list else '없음'} |",
-        f"| 신규 목돈 매수 금지(D) | {d_str if d_list else '없음'} |",
-        "",
-    ]
-
-    # ── 2. 신규 매수 실행표 ───────────────────────────────────────────────────
-    lines += ["신규 매수 실행표", ""]
-
-    valid_ab   = [
-        t for t in tde_results
-        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
-        and t["risk_reward"]["valid"]
-        and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
-    ]
+    dca_list = [t["name"] for t in tde_results
+                if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
     invalid_ab = [
         t for t in tde_results
         if t["trade_eligibility"]["buy_grade"] in ("A", "B")
@@ -2584,100 +2636,29 @@ def render_tde_report_section(tde_results):
                  and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"])
     ]
 
-    if valid_ab:
-        lines += [
-            "| 종목 | 등급 | 현재가 | 진입 가능 | 손절가 | 목표가 | 예상손실 | 기대수익 | R/R | 이유 |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-        ]
-        for t in valid_ab:
-            te  = t["trade_eligibility"]
-            rr  = t["risk_reward"]
-            sym = t["symbol"]
-            is_kr = sym.endswith(".KS") or sym.endswith(".KQ")
-            cur = "₩" if is_kr else "$"
-            def _fmt(v):
-                if v is None:
-                    return "-"
-                return f"{cur}{v:,.0f}" if is_kr else f"{cur}{v:.2f}"
-            gain_str = f"{rr['expected_gain_pct']:.1f}%" if rr["expected_gain_pct"] is not None else "-"
-            loss_str = f"{rr['expected_loss_pct']:.1f}%" if rr["expected_loss_pct"] is not None else "-"
-            rr_str   = f"{rr['reward_risk_ratio']:.2f}"  if rr["reward_risk_ratio"]  is not None else "-"
-            reason0  = te["reason"][0][:45] if te["reason"] else "-"
-            lines.append(
-                f"| {t['name']}({sym}) | {te['buy_grade']} | {_fmt(rr['entry_price'])} "
-                f"| O | {_fmt(rr['stop_price'])} | {_fmt(rr['target_price'])} "
-                f"| {loss_str} | {gain_str} | {rr_str} | {reason0} |"
-            )
-        lines.append("")
-    else:
-        lines += ["신규 매수 실행표 없음 — TDE 기준 A/B 조건 통과 종목 0개", ""]
+    data_status = "정상" if passed == total else f"일부 미수집 ({total - passed}개)"
+    ab_status   = f"{', '.join(ab_list)} 매수 가능" if ab_list else "신규 목돈 매수 금지"
+    dca_str     = ", ".join(dca_list) if dca_list else "없음"
 
-    if invalid_ab:
-        lines += [
-            "⚠️ TDE 경고: A/B 등급인데 리스크보상비 미확정 종목이 있습니다. 4단계 실패 조건 검증 필요.",
-            "",
-        ]
-
-    # ── 3. 자동 적립 유지표 ──────────────────────────────────────────────────
-    lines += ["자동 적립 유지표", ""]
-    dca_items = [t for t in tde_results if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]]
-    if dca_items:
-        lines += [
-            "| 종목 | 자동 적립 | 신규 목돈 매수 | 이유 |",
-            "| --- | --- | --- | --- |",
-        ]
-        for t in dca_items:
-            te   = t["trade_eligibility"]
-            bt   = te["buy_type"]
-            lump = "가능" if bt["lump_sum_buy_allowed"] else "금지"
-            r0   = _short_tde_reason(t)
-            lines.append(f"| {t['name']}({t['symbol']}) | 유지 가능 | {lump} | {r0} |")
-        lines.append("")
-    else:
-        lines += ["자동 적립 유지 가능 종목 없음", ""]
-
-    # ── 4. 오늘 금지 행동 ────────────────────────────────────────────────────
-    # portfolio_owned=True이고 auto_dca_allowed=False인 종목만 표시
-    # DCA 종목(VOO/GOOGL/FCX)은 자동 적립 유지표에서 이미 표시하므로 중복 제거
-    lines += ["오늘 금지 행동", ""]
-    d_items = [
-        t for t in tde_results
-        if t["trade_eligibility"]["buy_grade"] == "D"
-        and t.get("portfolio_owned", True)
-        and not t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]
+    lines = ["🔍 TDE 최종 검증 요약", ""]
+    lines += [
+        "| 항목 | 결과 | 판단 |",
+        "| --- | --- | --- |",
+        f"| 실시간 데이터 검증 | {passed}개 / {total}개 | {data_status} |",
+        f"| 신규 목돈 매수 A/B 후보 | {len(ab_list)}개 | {ab_status} |",
+        f"| 자동 적립(DCA) 가능 | {dca_str} | 단, 목돈 매수와 구분 |",
+        "| TDE/LLM 충돌 | 아래 참고 | 충돌 있으면 실전 매매 금지 |",
     ]
-    if d_items:
-        lines += [
-            "| 종목 | 금지 행동 | 이유 |",
-            "| --- | --- | --- |",
-        ]
-        for t in d_items:
-            cat = t["category"]
-            ds  = t["data_status"]
-            if not ds["price_collected"]:
-                action = "데이터 미수집 — 매매 금지"
-            elif cat == "유형③":
-                action = "신규/추매 금지"
-            elif cat == "유형④":
-                action = "물타기 금지"
-            elif cat == "유형②":
-                action = "비중 확대 금지"
-            elif cat == "유형①":
-                action = "목돈 추격매수 금지"
-            else:
-                action = "신규 매수 금지"
-            r0 = _short_tde_reason(t)
-            lines.append(f"| {t['name']}({t['symbol']}) | {action} | {r0} |")
-        lines.append("")
-
-    # ── 5. 오늘 실제 주문 가능 여부 ─────────────────────────────────────────
-    if valid_ab:
+    if ab_list:
+        lines.append(f"| 오늘 매수 가능 종목 | {', '.join(ab_list)} | 수동 확인 후 실행 |")
+    lines.append("")
+    if invalid_ab:
         lines.append(
-            "오늘 실제 신규 목돈 매수 후보 있음 — "
-            "단, 주문 수량/금액 자동 계산 전이므로 수동 검토 필요"
+            f"⚠️ TDE 경고: A/B 등급인데 리스크보상비 미확정 종목 {len(invalid_ab)}개 — "
+            "4단계 실패 조건 검증 필요."
         )
-    else:
-        lines.append("오늘 실제 신규 목돈 매수 주문 없음")
+        lines.append("")
+    lines.append("오늘 금지 행동/보유 종목 액션 — 상단 실행표 및 최종 실행 플랜 참고")
     lines.append("")
 
     return "\n".join(lines)
@@ -2749,6 +2730,7 @@ def generate_report(us_data, kr_data, exchange_rate,
 category3 자금 계산, category3_cash, category3_seed, cat3_total 출력은 전부 제거된 상태다.
 
 
+
 [보고서 목적 — 듀얼 엔진]
 이 보고서는 두 엔진을 동등한 비중으로 운영한다.
 A. 보유 포트폴리오 관리 엔진: 손익/리스크/실행 전략
@@ -2757,6 +2739,7 @@ B. 신규 수익 기회 발굴 엔진: 퀀트 필터 통과 후보 탐색
 
 [보고서 출력 순서 — 반드시 이 순서를 지켜라]
 0. 📌 오늘의 결론 한 장 요약
+0.5. 🚦 오늘 보고서 실전 사용 등급
 1. 💼 내 포트폴리오 전체 현황
 2. ✅ 오늘 보유 종목 실행표
 3. 📰 실시간 뉴스/이슈 영향 분석
@@ -2766,7 +2749,7 @@ B. 신규 수익 기회 발굴 엔진: 퀀트 필터 통과 후보 탐색
 7. 💰 매수 가능 금액/포지션 크기
 8. 📈 상승/하락 시나리오
 9. ⚠️ 리스크 경고판
-10. 🔍 데이터 신뢰도/TDE 검증
+10. 🔍 데이터 신뢰도 검증
 11. 📌 최종 실행 플랜
 
 [종목 분류 체계 — 4단계, 전 섹션에 적용]
@@ -2805,6 +2788,28 @@ B. 신규 수익 기회 발굴 엔진: 퀀트 필터 통과 후보 탐색
 - 실제 수치 채울 것. 빈칸/대략 금지.
 - 가격 조건 발동 종목이 있으면 반드시 종목명 명시.
 
+[섹션 0.5. 🚦 오늘 보고서 실전 사용 등급]
+보고서 상단에 오늘의 결론 직후 출력. 실전 매매에 쓸 수 있는 수준인지 판단.
+
+🚦 오늘 보고서 실전 사용 등급
+
+| 용도 | 등급 | 사용 가능 여부 | 이유 |
+|------|------|-------------|------|
+| 보유 포트폴리오 관리 | A/B/C/D | 가능/조건부/불가 | |
+| 손실 제한 판단 | A/B/C/D | 가능/조건부/불가 | |
+| 수익 실현/익절 판단 | A/B/C/D | 가능/조건부/불가 | |
+| 신규 수익 후보 관찰 | A/B/C/D | 가능/조건부/불가 | |
+| 신규 매수 실행 | A/B/C/D | 가능/조건부/불가 | |
+| 자동매매 연결 | D | 불가 | 사용자 수동 확인 필수 |
+
+등급 기준:
+- A: 데이터 정상 + 논리 오류 없음 + 실행 조건 명확
+- B: 데이터 대부분 정상 + 수동 확인 필요
+- C: 관찰 가능하지만 실행 불가
+- D: 사용 불가
+
+모델 정확도 30% 미만이면: 신규 매수 실행 무조건 D. 신규 후보 관찰은 B/C 가능. 보유관리는 데이터 정상일 때 A/B 가능.
+
 [섹션 1. 💼 내 포트폴리오 전체 현황]
 [포트폴리오 사전 계산값]을 그대로 사용해라. 직접 계산 금지.
 
@@ -2812,7 +2817,7 @@ B. 신규 수익 기회 발굴 엔진: 퀀트 필터 통과 후보 탐색
 
 | 항목 | 금액/비중 | 판단 |
 |------|-----------|------|
-| 총 원금 | 데이터 없으면 "원금 데이터 없음" | - |
+| 총 원금 | 확정 또는 "추정" 명시 | - |
 | 현재 평가금액 | 원화 환산 | - |
 | 총 평가손익 | 원화 | 수익/손실 |
 | 총 수익률 | % | - |
@@ -2831,9 +2836,12 @@ B. 신규 수익 기회 발굴 엔진: 퀀트 필터 통과 후보 탐색
 오늘 액션 단어: 보유 / 축소검토 / 익절검토 / 손절검토 / 추매금지 / 적립유지 / 데이터확인
 
 규칙:
-- 원금/평단 없으면 "데이터 없음"으로 표시.
+- portfolio.json에 평단/수량이 있으면 원금은 확정값으로 표시. 추정이면 "추정" 명시.
+- 현재가 있으면 현재잔액은 확정 평가값. 없으면 "산출 불가"로 표시.
+- 총자산/총손익/수익률은 "현재가 수집 완료 종목 기준"임을 명시.
 - 현재가 미수집이면 총자산/비중 "산출 불가" 표시. 현금만으로 총자산 확정값 출력 금지.
 - ⚠️ 단일 종목 20% 초과, 고위험 합산 10% 초과, 현금 5% 미만 자동 경고.
+- 표 아래에 반드시 추가: ※ 총 원금/총손익은 현재가 수집 완료 종목 기준. 미수집 종목은 별도 표기.
 
 [섹션 2. ✅ 오늘 보유 종목 실행표]
 보유 종목 전체를 중요도 순 정렬. 가격 조건 발동 종목 맨 위.
@@ -2851,19 +2859,25 @@ B. 신규 수익 기회 발굴 엔진: 퀀트 필터 통과 후보 탐색
 [섹션 3. 📰 실시간 뉴스/이슈 영향 분석]
 📰 실시간 뉴스/이슈 영향 분석
 
-| 종목/시장 | 이슈 | 출처/신뢰도 | 단기 영향 | 1~6개월 영향 | 행동 |
-|-----------|------|-----------|----------|------------|------|
+| 종목/시장 | 이슈 | 출처등급 | 신뢰도 | 가격 반영 여부 | 단기 영향 | 1~6개월 영향 | 행동 |
+|-----------|------|---------|------|------------|---------|------------|------|
+
+출처등급: A(공시/실적/정책/FDA) / B(목표가/기관/파트너십) / C(일반기사/블로그)
+신뢰도: 높음 / 중간 / 낮음
+가격 반영 여부: 미반영 / 일부 반영 / 대부분 반영 / 과잉 반영 / 확인 필요
+영향 분류: 강한 호재 / 약한 호재 / 중립 / 약한 악재 / 강한 악재 / 혼조 / 확인 필요
 
 포함 뉴스 유형: 기업/실적/수급/내부자거래/정책/정부지원/SNS 관심도/내한·이벤트/거시/섹터/경쟁사
-영향 분류: 강한 호재 / 약한 호재 / 중립 / 약한 악재 / 강한 악재 / 확인 필요
 
 규칙:
 - 뉴스가 주가에 미칠 영향을 반드시 분석. "뉴스 있음"으로 끝내지 마라.
 - 가격에 선반영됐는지/반영 여지가 있는지 판단.
+- 뉴스가 좋아도 가격 급등했으면 "추격 금지/눌림목 대기"로 표시.
+- 뉴스가 나빠도 과매도면 "즉시 매도"가 아니라 가격 조건 확인으로 표시.
+- SNS/내한/이벤트성 이슈는 단기 모멘텀과 실적 연결 가능성을 분리해서 판단.
+- 기업 뉴스와 거시 뉴스가 충돌하면 "혼조"로 표시.
 - 단일 소스 뉴스는 "확인 필요" 표시.
-- 뉴스 A등급: 정책/대형계약/실적/FDA/임상/규제/유상증자 — 반드시 4번 상세 전략에 반영.
-- 뉴스 B등급: 목표가/기관 수급/파트너십.
-- 뉴스 C등급: 일반 기사/블로그성 분석.
+- 뉴스 A등급: 4번 보유 종목별 상세 전략에 반드시 반영.
 
 [섹션 4. 📊 보유 종목별 상세 전략]
 📊 보유 종목별 상세 전략
@@ -2892,25 +2906,48 @@ RGTI: 상승 양자 정부지원 확정 +30~80% / 하락 내부자매도 지속+
 
 🎯 신규 수익 발굴 TOP 5
 
-| 순위 | 종목 | 구분 | 현재가 | 왜 후보인가 | 진입 조건 | 손절가 | 목표가 | 예상 상승률 | 예상 하락률 | RR | 등급 |
-|------|------|------|--------|-----------|---------|--------|--------|-----------|-----------|-----|------|
+| 순위 | 종목 | 유형 | 구분 | 현재가 | 후보 이유 | 진입 조건 | 손절가 | 목표가 | 예상 상승률 | 예상 하락률 | RR | 데이터 검증 | 등급 |
+|------|------|------|------|--------|---------|---------|--------|--------|-----------|-----------|-----|---------|------|
 
+유형: 안정형 / 추세형 / 이벤트형 / 보유추가형 / 현금대체형
 구분: 신규매수 / 추가매수 / 관찰후보 / 돌파후보 / 눌림목후보 / 이벤트후보 / 실적후보
 등급: A(오늘 매수 가능) / B(소액 분할 가능) / C(관찰) / D(제외)
+데이터 검증: 통과 / 단일소스 / 검증필요 / 실패
+
+후보 유형 목표 배분:
+- 안정형 1~2개: VOO, QQQ, SCHD, GOOGL, MSFT, FCX, GLD
+- 추세형 2~3개: HD현대일렉트릭, LS ELECTRIC, 한화에어로스페이스, 현대로템, 두산에너빌리티, LG전자, SK하이닉스, 한미반도체, AVGO, AMD, TSM, ASML, NVDA, PLTR, META, AMZN
+- 이벤트형 1개 이상: 정책/실적/수주/정부지원/내한/섹터 리레이팅 — 가격/거래량/수급 확인 필수
 
 후보 유니버스:
-미국: VOO, QQQ, SCHD, GOOGL, MSFT, AMZN, META, NVDA, AVGO, AMD, TSM, ASML, COST, LLY, UNH, JPM, XOM, CVX, NOC, LMT, FCX, GLD, TLT
+미국: VOO, QQQ, SCHD, GOOGL, MSFT, AMZN, META, NVDA, AVGO, AMD, TSM, ASML, COST, LLY, UNH, JPM, XOM, CVX, NOC, LMT, FCX, GLD, TLT, PLTR
 한국: 삼성전자, SK하이닉스, 한미반도체, 네이버, 카카오, LG전자, 현대차, 기아, 두산에너빌리티, HD현대일렉트릭, LS ELECTRIC, 한화에어로스페이스, 현대로템
 보유 종목(추가매수 가능): GOOGL, VOO, FCX 등
-보유 종목 제외(신규매수 금지): 셀트리온제약, RGTI, BEAM — 이 3개는 신규매수 후보 불가. 보유관리 섹션만.
 
 선정 원칙:
 - 꼭 대형주만 고르지 말 것. 제2의 SK하이닉스/LG전자/엔비디아처럼 추세가 강하게 붙을 수 있는 후보 탐색.
 - 종목보다 로직 우선. 단일 스토리보다 검증된 조건 우선.
 - 데이터 없으면 제외. A/B가 없으면 C 관찰 후보라도 5개 출력.
 - 예상 상승률/하락률/RR 전부 필수. 없으면 실패.
-- 모델 정확도 30% 미만이면 A/B 매수 금지. C 관찰 후보는 출력 가능.
-- 전략 분산: ETF / 우량주 / 성장주 / 이벤트 후보 고루.
+- 모델 정확도 30% 미만이면 A/B 매수 금지. C 관찰 후보는 출력 가능. 권장 매수금액 전부 0원.
+- 전략 분산: 안정형/추세형/이벤트형 고루.
+
+TOP 5 제외 규칙:
+- 셀트리온제약, RGTI, BEAM — 신규 수익 발굴 TOP 5 절대 금지. 보유관리 섹션만.
+- 보유 종목이 전체 5개 중 3개를 초과하면 안 됨.
+- 네이버 비중 18% 이상이면 신규 후보 아님 — 익절/관리 후보로 표시.
+- VOO는 안정형/현금대체형으로만 분류.
+- 데이터 미수집 종목은 TOP 5 절대 금지. "데이터 확인 필요" 부록에만 허용.
+- 손절가 >= 현재가이면 A/B 금지.
+- 목표가 <= 현재가이면 A/B 금지.
+- 단일 소스 수치이면 A/B 금지, C 관찰만 허용.
+
+수치 교차검증 결과 표 (TOP 5 아래 반드시 출력):
+
+| 후보 | 가격 검증 | 등락률 검증 | 실적/뉴스 수치 검증 | 손절/목표 구조 | 최종 |
+|------|---------|----------|------------|---------|------|
+
+판정: 통과 / 단일소스 / 검증필요 / 실패
 
 [섹션 6. 🧠 퀀트 필터 통과/탈락]
 🧠 퀀트 필터 통과/탈락
@@ -2976,7 +3013,7 @@ RGTI: 상승 양자 정부지원 확정 +30~80% / 하락 내부자매도 지속+
 | 시장 위험도 | VIX/거시 | - | 낮음/중간/높음 |
 | 가격 조건 발동 | N개 종목 | - | 있음/없음 |
 
-[섹션 10. 🔍 데이터 신뢰도/TDE 검증]
+[섹션 10. 🔍 데이터 신뢰도 검증]
 10번 섹션에 아래를 모두 출력해라:
 
 (a) 데이터 신뢰도:
@@ -2987,8 +3024,14 @@ RGTI: 상승 양자 정부지원 확정 +30~80% / 하락 내부자매도 지속+
 각 데이터 옆에 표시:
 ✅ 검증 완료 / 🟡 단일 소스 / ⚠️ 불일치 / ❌ 미수집
 
-(b) TDE 실전 매매 판단 결과 요약:
-(TDE 섹션은 코드가 계산한 결과이므로 LLM 본문 판단보다 우선. 임의 상향 금지.)
+미국/한국 데이터 기준일 표기 원칙:
+- 미국 주식 정규장 당일: "미국 주식: 정규장 종가/장중 데이터 — YYYY-MM-DD 기준"
+- 미국 주식 주말/휴장일: "미국 주식: 최근 정규장 종가 기준 — YYYY-MM-DD"
+- 날짜가 토요일/일요일이면 "전일 종가"라고 단정 금지.
+- 한국 주식 휴장일이면: "한국 주식: 최근 정규장 종가 기준"
+
+(b) TDE 실전 매매 판단 결과:
+TDE 섹션은 코드가 계산한 결과이므로 LLM 본문 판단보다 우선. 임의 상향 금지.
 - 신규 목돈 매수 A/B 후보 수
 - 자동 적립 유지 가능 종목
 - 가격 조건 발동 종목 및 상태
@@ -3003,22 +3046,38 @@ RGTI: 상승 양자 정부지원 확정 +30~80% / 하락 내부자매도 지속+
 5. 현금 운용: (비중 유지/변경)
 6. 다음 매수 전환 조건: (모델 정확도 기준 + 후보 조건)
 
+[보고서 길이 원칙]
+- 7~9페이지 수준 목표
+- 상단 2페이지 안에 오늘 결론/포트폴리오/신규 후보 요약이 보여야 함
+- 같은 내용 2번 이상 표시 금지: 가격 조건은 상단 실행표+가격조건표에서만
+- 셀트리온/RGTI 설명은 상세 전략에서 1회, 실행표에서 1회만
+- TDE는 코드가 자동으로 하단에 추가하므로 본문에서 TDE 표 반복 금지
+- "신규 매수 금지"는 상단 요약/포지션 크기/최종 실행 플랜에만
+- 최종 실행 플랜은 요약형으로만
+
 [보고서 실패 조건 — 하나라도 발생 시 마지막에 반드시 표시]
-아래 조건이면 "보고서 실패 — 실전 매매 사용 금지"를 출력해라:
-- 보유 포트폴리오 총액이 현금만으로 확정값 표시됨
-- 현재가 미수집인데 총자산/비중을 확정값처럼 표시
-- 신규 후보 TOP 5가 없음
-- 보유관리만 있고 신규수익발굴 섹션이 빈약함 (5개 후보 없음)
-- 신규 후보에 진입가/손절가/목표가/상승률/하락률/RR이 없음
-- A/B 후보가 있는데 매수금액이 없음
-- 모델 정확도 30% 미만인데 신규 목돈 매수 제안
-- 데이터 미수집 종목이 A/B 후보
-- 셀트리온제약/RGTI/BEAM이 신규매수 후보로 등장
-- 뉴스가 있는데 주가 영향 분석이 없음
-- 예상 상승률/하락률이 전부 10% 이내로만 제한됨
-- "오늘 매수"와 "오늘 금지"가 충돌
-- 실시간 가격 미수집인데 매수/매도 판단을 낸 경우
-- 신규 매수 A등급인데 손절가/목표가/기대수익비 없음
+아래 조건이면 "❌ 보고서 실패 — 실전 매매 사용 금지"를 출력해라:
+1. 신규 후보 TOP 5가 없음
+2. 신규 후보 TOP 5에 진입가/손절가/목표가/RR/상승률/하락률 중 하나라도 없음
+3. 수치 검증 실패 후보가 TOP 5에 남아 있음
+4. 모델 정확도 30% 미만인데 신규 A/B 매수 제안 또는 매수금액 > 0
+5. 셀트리온제약/RGTI/BEAM이 신규 수익 발굴 TOP 5에 들어감
+6. 현재가 미수집 종목이 A/B/C 후보로 TOP 5에 들어감
+7. 보유 포트폴리오 총액이 현금만으로 확정 표시됨
+8. 뉴스가 있는데 주가 영향 분석이 없음
+9. 예상 상승률/하락률이 전부 ±10% 이내
+10. TDE/LLM 충돌이 있고 그 충돌이 미해결 상태
+11. 손절가 >= 현재가인데 A/B 후보
+12. 목표가 <= 현재가인데 A/B 후보
+13. "오늘 매수"와 "오늘 금지"가 같은 종목에 충돌
+14. 미국/한국 기준일이 휴장일인데 "전일 종가"로 잘못 표기
+15. 단일 소스 수치를 확정값처럼 표시
+
+경고로만 처리할 조건 (매수 실행으로 연결되면 실패):
+- 모델 정확도 낮음
+- 신규 A/B 후보 0개
+- 데이터 단일소스
+- 보유 고위험 비중 경고
 
 [TDE 실전 매매 판단 엔진 우선 원칙]
 TDE 섹션은 코드가 계산한 결과이므로, LLM 본문 판단보다 우선한다. LLM은 TDE의 buy_grade, 자동 적립 가능 여부, 신규 목돈 매수 금지 판단을 임의로 상향하거나 덮어쓰지 않는다.
