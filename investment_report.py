@@ -509,6 +509,242 @@ def _restricted_tickers_list(pf: dict) -> str:
     return ", ".join(names)
 
 
+# ── Candidate Screener Loader ─────────────────────────────────────────────────
+
+def load_latest_candidate_screener_results():
+    """
+    Loads the latest outputs/top_candidates_YYYYMMDD.json (read-only).
+    Tries today's date first; falls back to the most recent file.
+    Returns parsed dict or None on any failure. Never raises.
+    Does NOT import or execute candidate_screener.py.
+    """
+    import glob as _glob
+    outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    today = datetime.now().strftime("%Y%m%d")
+    today_path = os.path.join(outputs_dir, f"top_candidates_{today}.json")
+
+    if os.path.exists(today_path):
+        candidate_path = today_path
+    else:
+        pattern = os.path.join(outputs_dir, "top_candidates_*.json")
+        files = sorted(_glob.glob(pattern), reverse=True)
+        if not files:
+            return None
+        candidate_path = files[0]
+
+    try:
+        with open(candidate_path, encoding="utf-8") as _f:
+            return json.load(_f)
+    except Exception:
+        return None
+
+
+def build_screener_report_section(screener_data) -> str:
+    """
+    Builds the code-generated screener section appended after the LLM report.
+    Never raises; returns a non-empty fallback string when screener_data is None.
+    """
+    if screener_data is None:
+        return (
+            "\n\n🎯 신규 수익 발굴 스크리너 TOP 10\n\n"
+            "스크리너 데이터 없음 — candidate_screener.py --fast 를 먼저 실행하세요.\n\n"
+            "🧪 신규 후보 스크리너 품질 체크\n\n"
+            "데이터 없음 — 신규 후보 관찰: D / 불가\n"
+        )
+
+    top = screener_data.get("top_candidates", [])
+    meta = screener_data.get("meta", {})
+    qc = meta.get("quality_check", {})
+    scan_status = screener_data.get("market_scan_status", "unknown")
+    data_date = screener_data.get("date", "unknown")
+
+    lines = []
+    lines.append("")
+    lines.append("🎯 신규 수익 발굴 스크리너 TOP 10")
+    lines.append(
+        f"(데이터 날짜: {data_date} / 시장 스캔: {scan_status} "
+        f"/ 후보 수: {len(top)}개 / 실행 시간: {meta.get('elapsed_seconds', '?')}s)"
+    )
+    lines.append("")
+
+    if not top:
+        lines.append("후보 없음 — 스크리너 재실행 필요")
+    else:
+        lines.append("| 순위 | 종목 | 등급 | 유형 | 점수 | 현재가 | RR | 거래량 | 1일 | 20일 | 섹터 | 후보 출처 | 진입 판단 |")
+        lines.append("|------|------|------|------|------|--------|-----|--------|-----|------|------|---------|---------|")
+        for i, c in enumerate(top, 1):
+            ticker = c.get("ticker", "?")
+            grade = c.get("grade", "?")
+            ctype = c.get("candidate_type", "?")
+            score = c.get("total_score", 0)
+            price = c.get("current_price", 0) or 0
+            rr = c.get("risk_reward_ratio", 0) or 0
+            vr = c.get("volume_ratio", 0) or 0
+            p1d = c.get("price_1d_pct", 0) or 0
+            p20d = c.get("price_20d_pct", 0) or 0
+            sector = (c.get("sector") or "미분류")[:15]
+            source = "동적 스캔" if c.get("dynamic_pool") else "fallback"
+            currency = c.get("currency", "USD")
+            price_str = f"{price:,.0f}원" if currency == "KRW" else f"${price:.2f}"
+            model_acc = c.get("model_accuracy")
+            if grade in ("A", "B") and model_acc is not None and model_acc < 30:
+                judgment = "실행 보류 (정확도 낮음)"
+            elif grade in ("A", "B"):
+                judgment = "매수 후보"
+            elif grade == "C":
+                judgment = "관찰 후보"
+            else:
+                judgment = "제외/주의"
+            lines.append(
+                f"| {i} | {ticker} | {grade} | {ctype} | {score} "
+                f"| {price_str} | {rr:.2f} | {vr:.2f}x "
+                f"| {p1d:+.1f}% | {p20d:+.1f}% | {sector} "
+                f"| {source} | {judgment} |"
+            )
+
+    lines.append("")
+    lines.append("🧪 신규 후보 스크리너 품질 체크")
+    lines.append("")
+    lines.append("| 항목 | 값 | 판단 |")
+    lines.append("|------|-----|------|")
+
+    def _qj(key, val):
+        if key == "top5_d_count":
+            return "정상" if val == 0 else f"⚠️ D등급 {val}개"
+        if key == "top5_sharp_drop_count":
+            return "정상" if val == 0 else f"⚠️ 급락 {val}개 — TOP5 미허용"
+        if key == "sharp_drop_in_top_count":
+            return "정상" if val == 0 else f"⚠️ 급락 후보 {val}개"
+        if key == "top_dynamic_count":
+            return "양호" if val >= 5 else f"주의 (동적 {val}개)"
+        if key == "news_missing_count":
+            if val == 0:
+                return "정상"
+            return "뉴스 데이터 미연결 — 후보 관찰용" if val >= len(top) else f"뉴스 미수집 {val}개"
+        if key == "top_fallback_count":
+            return "정상" if val == 0 else ("fallback 의존도 높음" if val >= 5 else f"fallback {val}개")
+        if key == "rr_below_1_excluded":
+            return "정상" if val == 0 else f"⚠️ RR<1.0 {val}개 차단됨"
+        if key == "volume_condition_mismatch":
+            return f"vol<1.3 후보 {val}개 (진입 보류 문구 표시)" if val > 0 else "정상"
+        return str(val)
+
+    qc_labels = [
+        ("top5_d_count",           "TOP5 D등급 수"),
+        ("top5_sharp_drop_count",  "TOP5 급락 후보 수"),
+        ("sharp_drop_in_top_count","TOP 전체 급락 수"),
+        ("top_d_count",            "TOP 전체 D등급 수"),
+        ("rr_below_1_excluded",    "RR<1.0 제거 수"),
+        ("volume_condition_mismatch", "거래량 조건 미충족"),
+        ("top_dynamic_count",      "동적 스캔 출신 수"),
+        ("top_fallback_count",     "fallback 출신 수"),
+        ("news_missing_count",     "뉴스 미수집 수"),
+    ]
+    for key, label in qc_labels:
+        val = qc.get(key, 0)
+        lines.append(f"| {label} | {val} | {_qj(key, val)} |")
+    lines.append("")
+
+    # 실전 사용 등급 (스크리너 연동)
+    top5_d = qc.get("top5_d_count", 0)
+    top5_drop = qc.get("top5_sharp_drop_count", 0)
+    news_missing = qc.get("news_missing_count", 0)
+    dyn_count = qc.get("top_dynamic_count", 0)
+    has_enough = len(top) >= 5
+
+    if not has_enough or top5_d > 0 or top5_drop > 0:
+        obs_grade, obs_status = "D", "불가"
+        obs_reason = "스크리너 데이터 없음 또는 TOP5 품질 미달"
+    elif news_missing >= max(len(top), 1):
+        obs_grade, obs_status = "C", "가능 — 관찰 한정"
+        obs_reason = "스크리너 TOP 10 정상, 단 뉴스 데이터 미연결"
+    elif dyn_count >= 5:
+        obs_grade, obs_status = "C", "가능 — 관찰 한정"
+        obs_reason = f"동적 스캔 {dyn_count}개, 단일소스"
+    else:
+        obs_grade, obs_status = "C", "조건부"
+        obs_reason = "fallback 비중 높음"
+
+    lines.append("신규 후보 스크리너 연동 실전 사용 등급")
+    lines.append("")
+    lines.append("| 용도 | 등급 | 상태 | 이유 |")
+    lines.append("|------|------|------|------|")
+    lines.append(f"| 신규 수익 후보 관찰 | {obs_grade} | {obs_status} | {obs_reason} |")
+    lines.append("| 신규 매수 실행 | D | 불가 | 모델 정확도 확인 필요 / A/B 후보 없음 (단일소스 구조) |")
+    lines.append("| 오늘 신규 매수 금액 | — | 0원 | 관찰 단계 — 매수 전환 조건 미충족 |")
+    lines.append("")
+
+    # 최종 실행 플랜 (스크리너 연동)
+    lines.append("스크리너 연동 최종 실행 플랜")
+    lines.append("")
+    lines.append("오늘 신규 매수: 0원")
+    if top:
+        obs_tickers = ", ".join(c.get("ticker", "?") for c in top[:5])
+        lines.append(f"오늘 신규 후보 관찰: {obs_tickers}")
+    else:
+        lines.append("오늘 신규 후보 관찰: 없음 — 스크리너 재실행 필요")
+    lines.append("")
+    lines.append("매수 전환 조건 (전부 충족 시):")
+    lines.append("  1. 모델 정확도 30% 이상 회복")
+    lines.append("  2. 뉴스/이벤트 2차 데이터소스 연결")
+    lines.append("  3. 후보 RR 1.5 이상 유지")
+    lines.append("  4. 거래량 조건 충족 (vol ratio 1.3x 이상)")
+    lines.append("  5. 후보 등급 C → B 이상으로 승격")
+    lines.append("")
+    lines.append("주의: C등급 후보는 관찰 전용. 매수 실행 금지.")
+
+    # 경고
+    warns = []
+    if scan_status in ("partial", "fallback"):
+        warns.append(f"market_scan_status={scan_status} — 시장 커버리지 제한")
+    if news_missing >= max(len(top), 1) and top:
+        warns.append("전 후보 뉴스 미수집 — 뉴스 이벤트 별도 확인 필요")
+    if qc.get("top_fallback_count", 0) >= 3:
+        warns.append(f"fallback 출신 {qc['top_fallback_count']}개 — KR 동적 스캔 미연결")
+    if top and all(c.get("grade") == "C" for c in top):
+        warns.append("전 후보 C등급 — A/B 승격 전까지 매수 실행 불가")
+    if warns:
+        lines.append("")
+        lines.append("⚠️ 스크리너 경고:")
+        for w in warns:
+            lines.append(f"  - {w}")
+
+    return "\n".join(lines)
+
+
+def _screener_context_for_llm(screener_data) -> str:
+    """Short summary injected into LLM user_content for section 5 reference."""
+    if screener_data is None:
+        return "스크리너 데이터 없음 — candidate_screener.py를 실행하세요."
+    top = screener_data.get("top_candidates", [])
+    meta = screener_data.get("meta", {})
+    qc = meta.get("quality_check", {})
+    lines = [
+        f"스크리너 날짜: {screener_data.get('date', '?')} / 스캔 상태: {screener_data.get('market_scan_status', '?')}",
+        f"TOP {len(top)}개 후보 / top5_d_count={qc.get('top5_d_count',0)} / top5_sharp_drop={qc.get('top5_sharp_drop_count',0)}",
+        f"동적 스캔={qc.get('top_dynamic_count',0)}개 / fallback={qc.get('top_fallback_count',0)}개 / 뉴스 미수집={qc.get('news_missing_count',0)}개",
+        "",
+        "TOP 후보 요약 (관찰 후보 — C등급 전용, 신규 매수 금지):",
+    ]
+    for i, c in enumerate(top[:10], 1):
+        tp = c.get("trade_plan", {})
+        ec = tp.get("entry_conditions", {})
+        vol_cond = ec.get("volume", "")
+        lines.append(
+            f"  {i}. {c.get('ticker')} [{c.get('grade')}] {c.get('candidate_type')} "
+            f"score={c.get('total_score')} RR={c.get('risk_reward_ratio',0):.2f} "
+            f"vol={c.get('volume_ratio',0):.2f}x 1d={c.get('price_1d_pct',0):+.1f}% "
+            f"20d={c.get('price_20d_pct',0):+.1f}% | {vol_cond}"
+        )
+    lines.append("")
+    lines.append(
+        "주의: 위 후보들은 모두 C등급 관찰 후보입니다. "
+        "단일소스/모델 정확도 제한으로 A/B 매수 후보 없음. "
+        "섹션 5에서 C 관찰 후보로만 표시하고 매수금액 0원으로 유지하세요."
+    )
+    return "\n".join(lines)
+
+
 # ── 환율 조회 ─────────────────────────────────────────────────────────────────
 def get_exchange_rate():
     print("  환율(KRW/USD) 조회 중...", flush=True)
@@ -2750,7 +2986,7 @@ def generate_report(us_data, kr_data, exchange_rate,
                     macro_data, fear_greed, insider_trades,
                     congress_trades, put_call_ratio, portfolio_data=None,
                     news_data=None, earnings_data=None, patterns_str=None,
-                    price_trigger_str=None):
+                    price_trigger_str=None, screener_context=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today        = _report_date_kst_str()       # KST 기준 날짜 (예: 2026년 06월 03일)
     generated_at = _report_timestamp_kst_str()  # KST 기준 타임스탬프 (예: 2026-06-03 07:17 KST)
@@ -3215,6 +3451,8 @@ user_content의 [가격 조건 발동 상태]에 TRIGGERED 종목이 있을 경�
         f"[최근 실패/성공 패턴 요약 — 반영규칙 준수]\n{patterns_str or '패턴 데이터 없음'}\n\n"
         f"[실행 완료된 매매 내역]\n{executed_summary}\n\n"
         f"[가격 조건 발동 상태 — 반드시 본문에 반영]\n{price_trigger_str or '가격 조건 상태 데이터 없음'}\n\n"
+        f"[신규 수익 발굴 스크리너 결과 — 섹션 5 작성 시 우선 참고. C등급 관찰 후보만. 매수금액 0원.]\n"
+        f"{screener_context or '스크리너 데이터 없음 — 섹션 5는 관찰 후보 없음으로 처리'}\n\n"
         f"오늘 날짜: {today} (KST 기준)\n"
         f"데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)\n"
         f"실시간 환율: {exchange_rate}원/달러\n\n"
@@ -3721,12 +3959,28 @@ def run_daily_report():
         price_trigger_results = []
         price_trigger_str = "가격 조건 판정 실패"
 
+    print(f"\n[SCREENER] 신규 후보 스크리너 결과 로드", flush=True)
+    screener_data = None
+    screener_context = None
+    try:
+        screener_data = load_latest_candidate_screener_results()
+        if screener_data:
+            _top_cnt = len(screener_data.get("top_candidates", []))
+            _sdate = screener_data.get("date", "?")
+            print(f"  → 스크리너 결과 로드 완료: {_top_cnt}개 후보 / 날짜={_sdate}", flush=True)
+            screener_context = _screener_context_for_llm(screener_data)
+        else:
+            print("  → 스크리너 결과 없음 (outputs/top_candidates_*.json 미존재)", flush=True)
+    except Exception as _se:
+        print(f"  → 스크리너 결과 로드 실패: {_se}", flush=True)
+
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
                                       macro_data, fear_greed, insider_trades,
                                       congress_trades, put_call_ratio, portfolio_data,
                                       news_data, earnings_data, patterns_str,
-                                      price_trigger_str=price_trigger_str)
+                                      price_trigger_str=price_trigger_str,
+                                      screener_context=screener_context)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
 
     # 목표가/손절가 portfolio.json에 자동 저장
@@ -3830,6 +4084,15 @@ def run_daily_report():
         save_learning_log(log_entry)
     except Exception as e:
         print(f"  learning_log 저장 실패: {e}", flush=True)
+
+    # 스크리너 섹션을 보고서 하단에 추가 (코드 생성 — LLM 본문 훼손 없음)
+    try:
+        if isinstance(report, str):
+            _screener_section = build_screener_report_section(screener_data)
+            report = report + "\n\n" + _screener_section
+            print(f"  [SCREENER] 보고서 하단에 스크리너 섹션 추가 완료 ({len(_screener_section)}자)", flush=True)
+    except Exception as _sse:
+        print(f"  [SCREENER][WARN] 스크리너 섹션 추가 실패: {_sse}", flush=True)
 
     # TDE 섹션을 보고서 하단에 추가 (코드가 직접 생성 — LLM 본문 훼손 없음)
     try:
