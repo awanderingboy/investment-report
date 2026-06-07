@@ -14,7 +14,7 @@ on:
 jobs:
   run-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -27,6 +27,30 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Run candidate screener
+        continue-on-error: true
+        run: python candidate_screener.py --fast --timeout-seconds 300
+
+      - name: Check candidate screener output
+        continue-on-error: true
+        run: |
+          ls -lah outputs || true
+          python - <<'EOF'
+          import glob, json, os
+          files = sorted(glob.glob("outputs/top_candidates_*.json"))
+          print("candidate files:", files[-3:] if files else [])
+          if files:
+              path = files[-1]
+              with open(path, encoding="utf-8") as f:
+                  data = json.load(f)
+              print("latest:", path)
+              print("top_candidates:", len(data.get("top_candidates", [])))
+              print("market_scan_status:", data.get("market_scan_status"))
+              print("quality_check:", data.get("meta", {}).get("quality_check", {}))
+          else:
+              print("No top_candidates json found — report will run without screener data")
+          EOF
 
       - name: Run investment report
         env:
