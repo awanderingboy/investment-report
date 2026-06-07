@@ -696,18 +696,23 @@ def _is_fin_sector(sector: str) -> bool:
 
 
 def _top_sort_key(c: dict) -> tuple:
-    """Quality-first sort: lower tuple = higher priority."""
+    """Quality-first sort: lower tuple = higher priority.
+    Priority: validation → grade → drop → RR → volume → type → score
+    Grade and drop are evaluated before volume so D/dropped candidates
+    never rank above stable C candidates regardless of volume_ratio.
+    """
+    verdict = c.get("_validation_verdict", "pass")
+    grade = c.get("grade", "D")
     rr = c.get("risk_reward_ratio") or 0
     vr = c.get("volume_ratio") or 0
     p1d = c.get("price_1d_pct", 0.0)
     ctype = c.get("candidate_type", "")
-    verdict = c.get("_validation_verdict", "pass")
     k1 = 0 if verdict == "pass" else (1 if verdict == "warning" else 2)
-    k2 = 0 if rr >= 1.5 else 1
-    k3 = 0 if vr >= 1.3 else 1
-    k4 = 0 if p1d > -5 else 1
-    k5 = 0 if ctype in ("추세형", "이벤트형") else 1
-    k6 = GRADE_ORDER.get(c.get("grade", "D"), 3)
+    k2 = GRADE_ORDER.get(grade, 3)                                  # C(2) always before D(3)
+    k3 = 1 if (c.get("_sharp_drop_flag") or p1d <= -5) else 0      # drop penalized
+    k4 = 0 if rr >= 1.5 else 1
+    k5 = 0 if vr >= 1.3 else 1
+    k6 = 0 if ctype in ("추세형", "이벤트형") else 1
     k7 = -c.get("total_score", 0)
     return (k1, k2, k3, k4, k5, k6, k7)
 
@@ -719,7 +724,9 @@ def select_top_candidates(
 ) -> list:
     """
     Select top candidates with quality-first ordering and composition rules.
-    Two-pass: pass1 fills positions 1-5 (top5 sector cap ≤2), pass2 fills 6-max (global cap ≤3).
+    Two-pass: pass1 fills positions 1-5 (strict), pass2 fills 6-max.
+    D-grade / sharp-drop candidates are barred from top-5 unconditionally.
+    D-grade is barred from top-10 entirely when enough C+ candidates exist.
     """
     eligible = [
         c for c in scored_candidates
@@ -730,14 +737,18 @@ def select_top_candidates(
     ]
     eligible.sort(key=_top_sort_key)
 
+    # Count C-or-better eligible candidates to decide if D is ever needed
+    c_plus_eligible = [c for c in eligible if c.get("grade") not in ("D", "EXCLUDE")]
+    allow_d_in_top = len(c_plus_eligible) < max_candidates
+
     top = []
     added_tickers = set()
-    sector_counts = {}    # global sector counts
-    sector_top5 = {}      # sector counts within top-5 positions
+    sector_counts = {}
+    sector_top5 = {}
     fin_count = 0
     type_counts = {"추세형": 0, "안정형": 0, "보유추가형": 0}
     dynamic_count = 0
-    sector_skipped = set()  # tickers skipped due to sector (may be recovered in pass2)
+    sector_skipped = set()
 
     def _accept(c):
         nonlocal fin_count, dynamic_count
@@ -776,11 +787,27 @@ def select_top_candidates(
             return False
         return True
 
-    # Pass 1: fill positions 1–5 (strict sector cap)
+    def _grade_ok_top5(c) -> bool:
+        """Positions 1-5: no D grade, no sharp-drop."""
+        if c.get("grade") == "D":
+            return False
+        if c.get("_sharp_drop_flag") or (c.get("price_1d_pct", 0.0) <= -5):
+            return False
+        return True
+
+    def _grade_ok_top10(c) -> bool:
+        """Positions 6-10: D allowed only when C+ candidates are insufficient."""
+        if not allow_d_in_top and c.get("grade") == "D":
+            return False
+        return True
+
+    # Pass 1: fill positions 1–5 (strict grade + sector cap)
     for c in eligible:
         if len(top) >= min(5, max_candidates):
             break
         if c["ticker"] in added_tickers:
+            continue
+        if not _grade_ok_top5(c):
             continue
         if not _type_ok(c):
             continue
@@ -789,11 +816,13 @@ def select_top_candidates(
             continue
         _accept(c)
 
-    # Pass 2: fill positions 6–max_candidates (global sector cap only)
+    # Pass 2: fill positions 6–max_candidates (grade + global sector cap)
     for c in eligible:
         if len(top) >= max_candidates:
             break
         if c["ticker"] in added_tickers:
+            continue
+        if not _grade_ok_top10(c):
             continue
         if not _type_ok(c):
             continue
@@ -812,10 +841,12 @@ def select_top_candidates(
     if dynamic_count < 2:
         warnings_out.append(f"dynamic_pool 후보 {dynamic_count}개 < 2개 권장")
 
-    # Defensive/sector-only warning
     fin_in_top = sum(1 for c in top if _is_fin_sector(c.get("sector")))
     if len(top) > 0 and fin_in_top == len(top):
         warnings_out.append("안정/방어 섹터만으로 TOP 구성 — 다양성 재검토 필요")
+
+    if any(c.get("grade") == "D" for c in top):
+        warnings_out.append("D등급 후보 포함 — 후보 부족")
 
     if warnings_out:
         print("  [WARNING] TOP 선정 구성 경고:", flush=True)
@@ -938,6 +969,10 @@ def run_screening(
         "news_missing_count": sum(1 for c in top if c.get("_news_missing")),
         "top_dynamic_count": sum(1 for c in top if c.get("dynamic_pool")),
         "top_fallback_count": sum(1 for c in top if not c.get("dynamic_pool")),
+        "top_d_count": sum(1 for c in top if c.get("grade") == "D"),
+        "top5_d_count": sum(1 for c in top[:5] if c.get("grade") == "D"),
+        "top5_sharp_drop_count": sum(1 for c in top[:5] if c.get("_sharp_drop_flag")),
+        "sharp_drop_in_top_count": sum(1 for c in top if c.get("_sharp_drop_flag")),
     }
 
     meta["elapsed_seconds"] = elapsed
@@ -1286,6 +1321,124 @@ def _run_mock_tests() -> bool:
     except Exception as e:
         check("T25: 뉴스 없는 후보 → news_score 5", False, str(e))
 
+    # ── Grade/drop sort order tests ──────────────────────────────────────────
+
+    # T26: D등급 급락 vs C등급 정상 → C가 반드시 앞에 위치
+    try:
+        amat_like = {"ticker": "DROPTICK", "grade": "D", "total_score": 52,
+                     "_validation_verdict": "warning", "candidate_type": "이벤트형",
+                     "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.42,
+                     "price_1d_pct": -9.7, "_sharp_drop_flag": "1일 -9.7% 급락",
+                     "score_breakdown": {}}
+        mo_like = {"ticker": "STABLETICK", "grade": "C", "total_score": 64,
+                   "_validation_verdict": "warning", "candidate_type": "추세형",
+                   "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.01,
+                   "price_1d_pct": 2.3, "score_breakdown": {}}
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            top26 = select_top_candidates([amat_like, mo_like], max_candidates=10)
+        stable_pos = next((i for i, c in enumerate(top26) if c["ticker"] == "STABLETICK"), None)
+        drop_pos = next((i for i, c in enumerate(top26) if c["ticker"] == "DROPTICK"), None)
+        c_before_d = (stable_pos is not None and (drop_pos is None or stable_pos < drop_pos))
+        check("T26: C등급 정상 후보가 D등급 급락 후보보다 앞에 위치", c_before_d,
+              f"stable_pos={stable_pos}, drop_pos={drop_pos}")
+    except Exception as e:
+        check("T26: C등급 정상이 D등급 급락보다 앞", False, str(e))
+
+    # T27: TOP 5에 D등급 없음
+    try:
+        c_cands27 = [{"ticker": f"C27_{i}", "grade": "C", "total_score": 70 - i,
+                      "_validation_verdict": "pass", "candidate_type": "추세형",
+                      "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                      "price_1d_pct": 1.0, "sector": f"Sector{i}", "score_breakdown": {}}
+                     for i in range(5)]
+        d_cands27 = [{"ticker": f"D27_{i}", "grade": "D", "total_score": 80 - i,
+                      "_validation_verdict": "warning", "candidate_type": "이벤트형",
+                      "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                      "price_1d_pct": -9.0, "_sharp_drop_flag": "급락",
+                      "sector": f"DropSec{i}", "score_breakdown": {}}
+                     for i in range(5)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            top27 = select_top_candidates(c_cands27 + d_cands27, max_candidates=10)
+        d_in_top5 = any(c.get("grade") == "D" for c in top27[:5])
+        check("T27: TOP 5에 D등급 없음", not d_in_top5,
+              f"d_in_top5={d_in_top5}, top5={[c['ticker'] for c in top27[:5]]}")
+    except Exception as e:
+        check("T27: TOP 5에 D등급 없음", False, str(e))
+
+    # T28: TOP 5에 _sharp_drop_flag 없음
+    try:
+        sharp_cands = [{"ticker": f"SH{i}", "grade": "C", "total_score": 75 - i,
+                        "_validation_verdict": "warning", "candidate_type": "이벤트형",
+                        "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                        "price_1d_pct": -6.0, "_sharp_drop_flag": "급락",
+                        "sector": f"ShSec{i}", "score_breakdown": {}}
+                       for i in range(3)]
+        normal_cands = [{"ticker": f"NM{i}", "grade": "C", "total_score": 65 - i,
+                         "_validation_verdict": "pass", "candidate_type": "추세형",
+                         "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                         "price_1d_pct": 1.0, "sector": f"NmSec{i}", "score_breakdown": {}}
+                        for i in range(7)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            top28 = select_top_candidates(sharp_cands + normal_cands, max_candidates=10)
+        sharp_in_top5 = any(c.get("_sharp_drop_flag") for c in top28[:5])
+        check("T28: TOP 5에 _sharp_drop_flag 없음", not sharp_in_top5,
+              f"sharp_in_top5={sharp_in_top5}, top5={[c['ticker'] for c in top28[:5]]}")
+    except Exception as e:
+        check("T28: TOP 5에 _sharp_drop_flag 없음", False, str(e))
+
+    # T29: C 후보 10개 이상이면 D 후보 TOP 전체 제외
+    try:
+        sectors29 = ["Tech", "Finance", "Health", "Energy"]
+        c_cands29 = [{"ticker": f"C29_{i}", "grade": "C", "total_score": 80 - i,
+                      "_validation_verdict": "pass", "candidate_type": "추세형",
+                      "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                      "price_1d_pct": 1.0, "sector": sectors29[i % 4], "score_breakdown": {}}
+                     for i in range(12)]
+        d_cands29 = [{"ticker": f"D29_{i}", "grade": "D", "total_score": 90 - i,
+                      "_validation_verdict": "warning", "candidate_type": "이벤트형",
+                      "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                      "price_1d_pct": -9.0, "_sharp_drop_flag": "급락",
+                      "sector": f"DSec{i}", "score_breakdown": {}}
+                     for i in range(3)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            top29 = select_top_candidates(c_cands29 + d_cands29, max_candidates=10)
+        d_in_top = any(c.get("grade") == "D" for c in top29)
+        check("T29: C 후보 10개+ → D 후보 TOP 전체 제외", not d_in_top,
+              f"d_in_top={d_in_top}, top={[c['ticker'] for c in top29]}")
+    except Exception as e:
+        check("T29: C 후보 10개+ → D 후보 TOP 제외", False, str(e))
+
+    # T30: C 후보 부족 시 D 후보 후순위(6-10) 허용, TOP 5는 비허용
+    try:
+        c_cands30 = [{"ticker": f"C30_{i}", "grade": "C", "total_score": 70 - i,
+                      "_validation_verdict": "pass", "candidate_type": "추세형",
+                      "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                      "price_1d_pct": 1.0, "sector": f"UniqSec{i}", "score_breakdown": {}}
+                     for i in range(5)]
+        d_cands30 = [{"ticker": f"D30_{i}", "grade": "D", "total_score": 55 - i,
+                      "_validation_verdict": "warning", "candidate_type": "이벤트형",
+                      "dynamic_pool": True, "risk_reward_ratio": 2.0, "volume_ratio": 1.5,
+                      "price_1d_pct": -6.0, "_sharp_drop_flag": "급락",
+                      "sector": f"DSec30_{i}", "score_breakdown": {}}
+                     for i in range(5)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            top30 = select_top_candidates(c_cands30 + d_cands30, max_candidates=10)
+        d_in_top5 = any(c.get("grade") == "D" for c in top30[:5])
+        d_exists = any(c.get("grade") == "D" for c in top30)
+        check("T30: C 부족 → D 후보 후순위 허용, TOP 5 비허용",
+              d_exists and not d_in_top5,
+              f"d_exists={d_exists}, d_in_top5={d_in_top5}, "
+              f"top={[c['ticker'] for c in top30]}")
+    except Exception as e:
+        check("T30: C 부족 시 D 후보 후순위 허용", False, str(e))
+
     total = len(results)
     passed = sum(1 for _, s, _ in results if s == "PASS")
     failed_tests = [(n, d) for n, s, d in results if s == "FAIL"]
@@ -1304,7 +1457,7 @@ def _run_mock_tests() -> bool:
 def main():
     t0 = time.time()
     parser = argparse.ArgumentParser(description="candidate_screener — dynamic market screener")
-    parser.add_argument("--mock-test", action="store_true", help="Run mock tests (T1–T25)")
+    parser.add_argument("--mock-test", action="store_true", help="Run mock tests (T1–T30)")
     parser.add_argument("--markets", nargs="+", default=["US", "KR"])
     parser.add_argument("--max-pool", type=int, default=300)
     parser.add_argument("--max-us-tickers", type=int, default=None)
@@ -1356,6 +1509,10 @@ def main():
     print(f"  news_missing_count      : {qc.get('news_missing_count', 0)}")
     print(f"  top_dynamic_count       : {qc.get('top_dynamic_count', 0)}")
     print(f"  top_fallback_count      : {qc.get('top_fallback_count', 0)}")
+    print(f"  top_d_count             : {qc.get('top_d_count', 0)}")
+    print(f"  top5_d_count            : {qc.get('top5_d_count', 0)}")
+    print(f"  top5_sharp_drop_count   : {qc.get('top5_sharp_drop_count', 0)}")
+    print(f"  sharp_drop_in_top_count : {qc.get('sharp_drop_in_top_count', 0)}")
 
     if result["top_candidates"]:
         print("\n--- TOP 후보 ---")
