@@ -324,3 +324,71 @@ if auto_refresh:
     time.sleep(30)
     st.cache_data.clear()
     st.rerun()
+
+st.markdown("---")
+st.markdown("### 🏭 생산 작업 현황")
+st.caption("단순 보고를 넘어 각 직원이 자율적으로 만들어내는 가치")
+
+total_ideas = sum(len(a.get("ideas_generated", [])) for a in agents.values())
+total_opps  = sum(len(a.get("opportunities_found", [])) for a in agents.values())
+total_review = sum(len(a.get("owner_review_items", [])) for a in agents.values())
+total_backlog = sum(len(a.get("productive_backlog", [])) for a in agents.values())
+
+pc1, pc2, pc3, pc4 = st.columns(4)
+with pc1:
+    st.metric("💡 오늘 아이디어", total_ideas)
+with pc2:
+    st.metric("🎯 발견된 기회", total_opps)
+with pc3:
+    st.metric("📋 대표 검토 항목", total_review)
+with pc4:
+    st.metric("📝 전체 백로그", total_backlog)
+
+st.markdown("")
+prod_cols = st.columns(2)
+agent_list_prod = [
+    ("investment_analyst", "📈 투자 애널리스트"),
+    ("auto_trader",        "🤖 퀀트 트레이더"),
+    ("business_analyst",   "🏪 비즈니스 애널리스트"),
+    ("marketing_creator",  "✨ 마케터 / 크리에이터"),
+]
+
+for idx, (agent_id, display_name) in enumerate(agent_list_prod):
+    agent = agents.get(agent_id, {})
+    col   = prod_cols[idx % 2]
+    with col:
+        productive = agent.get("productive_mode", False)
+        current    = agent.get("current_task", "")
+        required   = agent.get("required_tasks", [])
+        backlog    = agent.get("productive_backlog", [])
+        ideas      = agent.get("ideas_generated", [])
+        opps       = agent.get("opportunities_found", [])
+        review     = agent.get("owner_review_items", [])
+        mode_badge = "🟢 생산 모드" if productive else "⏳ 준비 중"
+        with st.expander(f"{display_name}  —  {mode_badge}", expanded=True):
+            if current:
+                st.markdown(f"**지금 하는 일** — {current}")
+            if required:
+                st.markdown("**✅ 필수 업무**")
+                for r in required:
+                    st.markdown(f"<div class='log-item'>• {r}</div>", unsafe_allow_html=True)
+            if backlog:
+                st.markdown("**📝 생산 백로그**")
+                for b in backlog[:4]:
+                    st.markdown(f"<div class='log-item'>→ {b}</div>", unsafe_allow_html=True)
+                if len(backlog) > 4:
+                    st.caption(f"외 {len(backlog)-4}개 더...")
+            if ideas:
+                st.markdown("**💡 오늘 아이디어**")
+                for idea in ideas:
+                    st.info(f"💡 {idea.get('title', '')} — {idea.get('detail', '')}")
+            if opps:
+                st.markdown("**🎯 발견된 기회**")
+                for opp in opps:
+                    st.success(f"🎯 {opp.get('title', '')} — {opp.get('detail', '')}")
+            if review:
+                st.markdown("**👀 대표 검토 필요**")
+                for item in review:
+                    st.warning(f"👀 {item.get('title', '')} — {item.get('detail', '')}")
+            if not ideas and not opps and not review:
+                st.caption("아직 생성된 아이디어/기회 없음 — 직원 기능 개발 후 자동 채워짐")
