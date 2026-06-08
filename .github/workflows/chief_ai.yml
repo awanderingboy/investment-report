@@ -1,19 +1,12 @@
-# .github/workflows/chief_ai.yml
-# 총괄 AI — 매일 자동 실행 + 수동 실행 가능
-# 기존 daily_report.yml과 완전히 독립된 별도 workflow
-
 name: Chief AI — Daily Summary
 
 on:
-  # 매일 KST 07:30 자동 실행 (UTC 22:30, 전날 기준)
   schedule:
     - cron: '30 22 * * *'
-
-  # 수동 실행 가능 (GitHub Actions 탭에서 Run workflow 버튼)
   workflow_dispatch:
     inputs:
       test_mode:
-        description: '테스트 모드 (텔레그램 테스트 메시지만 발송)'
+        description: '테스트 모드'
         required: false
         default: 'true'
         type: choice
@@ -38,12 +31,49 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
+      - name: Check Telegram secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "TELEGRAM_BOT_TOKEN: MISSING"
+          else
+            echo "TELEGRAM_BOT_TOKEN: EXISTS"
+          fi
+          if [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_CHAT_ID: MISSING"
+          else
+            echo "TELEGRAM_CHAT_ID: EXISTS"
+          fi
+
+      - name: Direct Telegram test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          print("TOKEN_EXISTS:", bool(token))
+          print("CHAT_ID_EXISTS:", bool(chat_id))
+          if not token or not chat_id:
+              print("SKIP: missing telegram env")
+              raise SystemExit(1)
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          res = requests.post(url, data={"chat_id": chat_id, "text": "✅ GitHub Actions 텔레그램 직접 테스트 성공"}, timeout=15)
+          print("STATUS_CODE:", res.status_code)
+          data = res.json()
+          print("OK:", data.get("ok"))
+          print("DESCRIPTION:", data.get("description"))
+          PY
+
       - name: 총괄 AI 실행
         env:
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 수동 실행 시 test_mode 입력값 사용, 자동 실행 시 false
           CHIEF_TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
         run: python chief_ai.py
 
