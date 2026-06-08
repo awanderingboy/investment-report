@@ -2,15 +2,17 @@
   "_schema_version": "2.0",
   "_description": "총괄 AI 상태 파일 — Streamlit/웹 대시보드 직접 연동용",
   "_last_updated_by": "chief_ai.py",
-  "updated_at": "2026-06-08 15:13:50 KST",
-  "updated_at_iso": "2026-06-08T15:13:50+09:00",
+
+  "updated_at": "2026-06-08 00:00:00 KST",
+  "updated_at_iso": "2026-06-08T00:00:00+09:00",
+
   "dashboard": {
-    "total_tasks_today": 1,
+    "total_tasks_today": 0,
     "total_agents": 4,
     "running_agents": 0,
-    "completed_agents": 1,
+    "completed_agents": 0,
     "error_agents": 0,
-    "pending_agents": 3,
+    "pending_agents": 0,
     "emergency_alert_count": 0,
     "important_alert_count": 0,
     "needs_owner_attention": false,
@@ -18,39 +20,35 @@
     "system_status": "normal",
     "system_status_label": "정상 운영 중"
   },
+
   "owner": {
     "tasks_today": [],
     "approval_required": [],
     "todays_focus": []
   },
+
   "agents": {
     "investment_analyst": {
       "id": "investment_analyst",
       "display_name": "투자 애널리스트",
       "icon": "chart-line",
       "description": "포트폴리오 분석 · 매일 07:13 KST 자동 실행",
-      "status": "completed",
-      "status_label": "완료",
+      "status": "idle",
+      "status_label": "대기 중",
       "phase": "active",
-      "last_run_at": "2026-06-08T10:09:48+09:00",
-      "last_run_at_iso": "2026-06-08T10:09:48+09:00",
+      "last_run_at": "",
+      "last_run_at_iso": "",
       "next_run_at": "07:13 KST",
-      "last_result": "오늘 보고서 발송 완료",
+      "last_result": "",
       "last_result_detail": "",
       "risk_level": "low",
       "needs_owner_approval": false,
-      "tasks_completed_today": 1,
-      "recent_tasks": [
-        {
-          "task": "투자 보고서 생성 및 발송",
-          "status": "completed",
-          "time": "2026-06-08T10:09:48+09:00"
-        }
-      ],
+      "tasks_completed_today": 0,
+      "recent_tasks": [],
       "errors": [],
       "metrics": {
         "win_rate_5d": null,
-        "report_sent_today": true,
+        "report_sent_today": false,
         "last_report_score": null
       }
     },
@@ -119,35 +117,16 @@
       "metrics": {}
     }
   },
+
   "alerts": {
     "emergency": [],
     "important": [],
     "daily_summary": [],
     "weekly_summary": []
   },
-  "activity_log": [
-    {
-      "time": "2026-06-08 15:13:48 KST",
-      "time_iso": "2026-06-08T15:13:48+09:00",
-      "agent": "chief_ai",
-      "level": "info",
-      "message": "총괄 AI 실행 완료 — 긴급:0 중요:0 확인항목:0"
-    },
-    {
-      "time": "2026-06-08 15:13:06 KST",
-      "time_iso": "2026-06-08T15:13:06+09:00",
-      "agent": "chief_ai",
-      "level": "info",
-      "message": "총괄 AI 실행 완료 — 긴급:0 중요:0 확인항목:0"
-    },
-    {
-      "time": "2026-06-08 15:11:17 KST",
-      "time_iso": "2026-06-08T15:11:17+09:00",
-      "agent": "chief_ai",
-      "level": "info",
-      "message": "총괄 AI 실행 완료 — 긴급:0 중요:0 확인항목:0"
-    }
-  ],
+
+  "activity_log": [],
+
   "permissions": {
     "allowed": [
       "데이터 수집",
