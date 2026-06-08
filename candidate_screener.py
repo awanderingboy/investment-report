@@ -616,6 +616,187 @@ def build_trade_plan(candidate: dict) -> dict:
     return candidate
 
 
+# ── Price Strategy Builder ─────────────────────────────────────────────────────
+
+def build_candidate_price_strategy(candidate: dict) -> dict:
+    """
+    Build actionable price strategy for a screener candidate.
+    Returns candidate with price_strategy dict added.
+    All prices validated: stop < current_price < target.
+    C-grade: today_buy_allowed=False, recommended_buy_amount=0 always.
+    Model accuracy < 30%: buy amount 0 always.
+    """
+    cp = candidate.get("current_price", 0) or 0
+    grade = candidate.get("grade", "?")
+    vr = candidate.get("volume_ratio", 0) or 0
+    p20 = candidate.get("price_20d_pct", 0.0) or 0.0
+    sharp_drop = candidate.get("_sharp_drop_flag", "")
+    news_missing = candidate.get("_news_missing", True)
+    model_acc = candidate.get("model_accuracy")
+    currency = candidate.get("currency", "USD")
+    is_kr = currency == "KRW"
+
+    def _r(x, decimals=4):
+        return round(x, decimals) if x is not None else None
+
+    # ── No price → all fields null ────────────────────────────────────────────
+    if cp <= 0:
+        candidate["price_strategy"] = {
+            "current_price": None,
+            "observe_entry_zone": "미산출 — 현재가 없음",
+            "entry_1": None, "entry_2": None,
+            "stop_loss": None,
+            "target_1": None, "target_2": None,
+            "upside_to_target_1_pct": None, "upside_to_target_2_pct": None,
+            "downside_to_stop_pct": None,
+            "calculated_rr": None,
+            "price_strategy_valid": False,
+            "price_strategy_warning": "current_price_missing",
+            "buy_transition_conditions": [],
+            "today_buy_allowed": False,
+            "recommended_buy_amount": 0,
+            "position_size_pct": 0,
+        }
+        return candidate
+
+    # ── Sharp drop → entry blocked ────────────────────────────────────────────
+    if sharp_drop:
+        candidate["price_strategy"] = {
+            "current_price": cp,
+            "observe_entry_zone": "반등 확인 후 재산출",
+            "entry_1": None, "entry_2": None,
+            "stop_loss": _r(cp * 0.92),
+            "target_1": None, "target_2": None,
+            "upside_to_target_1_pct": None, "upside_to_target_2_pct": None,
+            "downside_to_stop_pct": -8.0,
+            "calculated_rr": None,
+            "price_strategy_valid": False,
+            "price_strategy_warning": f"당일 급락 — {sharp_drop[:60]}",
+            "buy_transition_conditions": [
+                "당일 급락 종료 및 3일 이상 반등 확인",
+                "거래량 정상화 (1.3x 이상)",
+                "손절가/목표가 재산출 후 RR 1.5 이상 확인",
+            ],
+            "today_buy_allowed": False,
+            "recommended_buy_amount": 0,
+            "position_size_pct": 0,
+        }
+        return candidate
+
+    # ── Normal case: compute entry/stop/target ────────────────────────────────
+    # Entry/stop/target percentages based on trend strength
+    if p20 > 15:              # strong run — tighter entry
+        e1, e2, sp, t1, t2 = -0.010, -0.035, -0.065, 0.12, 0.22
+    elif p20 > 5:             # normal uptrend
+        e1, e2, sp, t1, t2 = -0.015, -0.045, -0.070, 0.10, 0.18
+    else:                     # neutral/weak
+        e1, e2, sp, t1, t2 = -0.020, -0.050, -0.080, 0.08, 0.15
+
+    entry_1 = _r(cp * (1 + e1))
+    entry_2 = _r(cp * (1 + e2))
+    stop    = _r(cp * (1 + sp))
+    target_1 = _r(cp * (1 + t1))
+    target_2 = _r(cp * (1 + t2))
+
+    # Override with existing trade_plan if tighter/better
+    tp = candidate.get("trade_plan", {})
+    if tp.get("stop_price") and 0 < tp["stop_price"] < cp:
+        stop = _r(tp["stop_price"])
+    if tp.get("target_price") and tp["target_price"] > cp:
+        target_1 = _r(tp["target_price"])
+
+    # ── Validation ────────────────────────────────────────────────────────────
+    warnings = []
+    valid = True
+
+    if stop is None or stop >= cp:
+        warnings.append("손절가 >= 현재가 — 전략 오류")
+        valid = False
+        stop = _r(cp * 0.92)  # safety fallback
+
+    if target_1 is None or target_1 <= cp:
+        warnings.append("목표가 <= 현재가 — 전략 오류")
+        valid = False
+        target_1 = _r(cp * 1.08)
+
+    # ── Upside/downside/RR ────────────────────────────────────────────────────
+    upside_1 = round((target_1 - cp) / cp * 100, 1)
+    upside_2 = round((target_2 - cp) / cp * 100, 1) if target_2 else None
+    downside = round((stop - cp) / cp * 100, 1)
+
+    risk     = cp - stop
+    reward_1 = target_1 - cp
+    calc_rr  = round(reward_1 / risk, 2) if risk > 0 else None
+
+    if calc_rr and calc_rr < 1.5:
+        warnings.append(f"RR={calc_rr:.2f} < 1.5 — 손익비 부족")
+        valid = False
+
+    # ── Volume/news warnings ──────────────────────────────────────────────────
+    if vr < 1.0:
+        warnings.append("거래량 부족 — 진입 보류")
+    elif vr < 1.3:
+        warnings.append("거래량 보통 — 추가 확인 필요")
+    if news_missing:
+        warnings.append("뉴스 미수집 — 뉴스 확인 전 매수 금지")
+
+    # ── Observe entry zone text ───────────────────────────────────────────────
+    if vr < 1.0:
+        observe_zone = "거래량 1.3x 이상 회복 후 재평가"
+    elif is_kr:
+        obs_lo = f"{cp * 0.99:,.0f}원"
+        obs_hi = f"{cp * 1.01:,.0f}원"
+        observe_zone = f"{obs_lo}~{obs_hi} 지지 또는 {cp * 1.015:,.0f}원 돌파"
+    else:
+        observe_zone = f"${cp * 0.99:.2f}~${cp:.2f} 지지 또는 ${cp * 1.015:.2f} 돌파"
+
+    # ── Buy transition conditions ─────────────────────────────────────────────
+    buy_conds = []
+    if news_missing:
+        buy_conds.append("뉴스/이벤트 2차 데이터소스 연결")
+    if vr < 1.3:
+        buy_conds.append(f"거래량 1.3x 이상 회복 (현재 {vr:.2f}x)")
+    buy_conds.append("모델 정확도 30% 이상 회복")
+    buy_conds.append("등급 C → B 이상으로 승격")
+    if calc_rr and calc_rr < 1.5:
+        buy_conds.append(f"RR 1.5 이상 확보 (현재 {calc_rr:.2f})")
+
+    # ── Position size — conservative defaults ─────────────────────────────────
+    # Model accuracy generally < 30% in this system → always 0
+    today_buy_allowed = False
+    recommended_buy_amount = 0
+    position_size_pct = 0
+
+    if (model_acc is not None and model_acc >= 30
+            and grade in ("A", "B")
+            and vr >= 1.3
+            and not news_missing
+            and calc_rr is not None and calc_rr >= 1.5):
+        today_buy_allowed = True
+        position_size_pct = 3 if model_acc >= 50 else 1
+
+    candidate["price_strategy"] = {
+        "current_price": cp,
+        "observe_entry_zone": observe_zone,
+        "entry_1": entry_1,
+        "entry_2": entry_2,
+        "stop_loss": stop,
+        "target_1": target_1,
+        "target_2": target_2,
+        "upside_to_target_1_pct": upside_1,
+        "upside_to_target_2_pct": upside_2,
+        "downside_to_stop_pct": downside,
+        "calculated_rr": calc_rr,
+        "price_strategy_valid": valid and (calc_rr is not None and calc_rr >= 1.5),
+        "price_strategy_warning": " / ".join(warnings) if warnings else None,
+        "buy_transition_conditions": buy_conds,
+        "today_buy_allowed": today_buy_allowed,
+        "recommended_buy_amount": recommended_buy_amount,
+        "position_size_pct": position_size_pct,
+    }
+    return candidate
+
+
 # ── Dynamic Pool Builder ───────────────────────────────────────────────────────
 
 def build_dynamic_candidate_pool(
@@ -933,7 +1114,7 @@ def run_screening(
             total_timeout_count += tc
             total_cache_hits += ch
             print(f"  [SCORE] Scoring {len(raw_pool)} raw candidates...", flush=True)
-            scored = [score_candidate(build_trade_plan(c)) for c in raw_pool]
+            scored = [build_candidate_price_strategy(score_candidate(build_trade_plan(c))) for c in raw_pool]
             all_candidates.extend(scored)
         else:
             print(f"  [DRY RUN] Skipping data fetch.", flush=True)
@@ -960,6 +1141,9 @@ def run_screening(
 
     elapsed = round(time.time() - start_time, 1)
 
+    def _ps(c):
+        return c.get("price_strategy", {})
+
     quality_check = {
         "rr_below_1_excluded": sum(1 for c in all_candidates if c.get("_rr_excluded")),
         "volume_condition_mismatch": sum(1 for c in top if (c.get("volume_ratio") or 0) < 1.3),
@@ -973,6 +1157,16 @@ def run_screening(
         "top5_d_count": sum(1 for c in top[:5] if c.get("grade") == "D"),
         "top5_sharp_drop_count": sum(1 for c in top[:5] if c.get("_sharp_drop_flag")),
         "sharp_drop_in_top_count": sum(1 for c in top if c.get("_sharp_drop_flag")),
+        # Price strategy quality
+        "price_strategy_valid_count": sum(1 for c in top if _ps(c).get("price_strategy_valid")),
+        "price_strategy_invalid_count": sum(1 for c in top if not _ps(c).get("price_strategy_valid")),
+        "buy_allowed_count": sum(1 for c in top if _ps(c).get("today_buy_allowed")),
+        "zero_buy_amount_count": sum(1 for c in top if _ps(c).get("recommended_buy_amount", 0) == 0),
+        "invalid_rr_count": sum(1 for c in top
+                                if (_ps(c).get("calculated_rr") or 0) < 1.5
+                                and _ps(c).get("current_price") is not None
+                                and not c.get("_sharp_drop_flag")),
+        "missing_price_strategy_count": sum(1 for c in top if "price_strategy" not in c),
     }
 
     meta["elapsed_seconds"] = elapsed

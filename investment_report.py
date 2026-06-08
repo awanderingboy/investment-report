@@ -570,42 +570,156 @@ def build_screener_report_section(screener_data) -> str:
     if not top:
         lines.append("후보 없음 — 스크리너 재실행 필요")
     else:
-        lines.append("| 순위 | 종목 | 등급 | 유형 | 점수 | 현재가 | RR | 거래량 | 1일 | 20일 | 섹터 | 후보 출처 | 진입 판단 |")
-        lines.append("|------|------|------|------|------|--------|-----|--------|-----|------|------|---------|---------|")
+        # ── TOP 10 요약표 ──────────────────────────────────────────────────────
+        lines.append("| 순위 | 종목 | 등급 | 현재가 | 손절가 | 1차목표 | 상승여력 | RR | 거래량 | 진입 판단 | 오늘 매수금액 |")
+        lines.append("|------|------|------|--------|--------|---------|---------|-----|--------|---------|------------|")
         for i, c in enumerate(top, 1):
             ticker = c.get("ticker", "?")
             grade = c.get("grade", "?")
-            ctype = c.get("candidate_type", "?")
-            score = c.get("total_score", 0)
-            price = c.get("current_price", 0) or 0
-            rr = c.get("risk_reward_ratio", 0) or 0
             vr = c.get("volume_ratio", 0) or 0
-            p1d = c.get("price_1d_pct", 0) or 0
-            p20d = c.get("price_20d_pct", 0) or 0
-            sector = (c.get("sector") or "미분류")[:15]
-            source = "동적 스캔" if c.get("dynamic_pool") else "fallback"
             currency = c.get("currency", "USD")
-            price_str = f"{price:,.0f}원" if currency == "KRW" else f"${price:.2f}"
+            is_kr = currency == "KRW"
+            price = c.get("current_price", 0) or 0
+            price_str = f"{price:,.0f}원" if is_kr else f"${price:.2f}"
+
+            ps = c.get("price_strategy", {})
+            stop = ps.get("stop_loss")
+            t1 = ps.get("target_1")
+            up1 = ps.get("upside_to_target_1_pct")
+            calc_rr = ps.get("calculated_rr")
+            buy_amt = ps.get("recommended_buy_amount", 0)
+
+            def _fmt_price(v, kr):
+                if v is None: return "미산출"
+                return f"{v:,.0f}원" if kr else f"${v:.2f}"
+
+            stop_str = _fmt_price(stop, is_kr)
+            t1_str   = _fmt_price(t1, is_kr)
+            up1_str  = f"+{up1:.1f}%" if up1 is not None else "?"
+            rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
+            buy_str  = f"{buy_amt:,}원" if buy_amt else "0원"
+
             model_acc = c.get("model_accuracy")
             if grade in ("A", "B") and model_acc is not None and model_acc < 30:
-                judgment = "실행 보류 (정확도 낮음)"
+                judgment = "실행 보류(정확도)"
             elif grade in ("A", "B"):
                 judgment = "매수 후보"
             elif grade == "C":
                 if vr >= 1.3:
                     judgment = "관찰 후보"
                 elif vr >= 1.0:
-                    judgment = "관찰 후보 / 거래량 추가 확인"
+                    judgment = "관찰/거래량 확인"
                 else:
-                    judgment = "관찰 후보 / 진입 보류"
+                    judgment = "관찰/진입 보류"
             else:
                 judgment = "제외/주의"
+
+            drop_flag = " ⚠️" if c.get("_sharp_drop_flag") else ""
             lines.append(
-                f"| {i} | {ticker} | {grade} | {ctype} | {score} "
-                f"| {price_str} | {rr:.2f} | {vr:.2f}x "
-                f"| {p1d:+.1f}% | {p20d:+.1f}% | {sector} "
-                f"| {source} | {judgment} |"
+                f"| {i} | {ticker}{drop_flag} | {grade} | {price_str} "
+                f"| {stop_str} | {t1_str} | {up1_str} | {rr_str} "
+                f"| {vr:.2f}x | {judgment} | {buy_str} |"
             )
+
+        # ── 가격전략 TOP 5 상세표 ──────────────────────────────────────────────
+        lines.append("")
+        lines.append("🎯 신규 후보 가격전략 TOP 5")
+        lines.append("")
+        lines.append("| 종목 | 현재가 | 관찰 진입가 | 손절가 | 1차 목표 | 2차 목표 | 상승여력 | 하락위험 | RR | 오늘 액션 |")
+        lines.append("|------|--------|------------|--------|----------|----------|---------|---------|-----|---------|")
+
+        for c in top[:5]:
+            ticker = c.get("ticker", "?")
+            grade = c.get("grade", "?")
+            vr = c.get("volume_ratio", 0) or 0
+            currency = c.get("currency", "USD")
+            is_kr = currency == "KRW"
+            price = c.get("current_price", 0) or 0
+            price_str = f"{price:,.0f}원" if is_kr else f"${price:.2f}"
+
+            ps = c.get("price_strategy", {})
+            obs = ps.get("observe_entry_zone", "?")
+            stop = ps.get("stop_loss")
+            t1 = ps.get("target_1")
+            t2 = ps.get("target_2")
+            up1 = ps.get("upside_to_target_1_pct")
+            up2 = ps.get("upside_to_target_2_pct")
+            down = ps.get("downside_to_stop_pct")
+            calc_rr = ps.get("calculated_rr")
+            buy_allowed = ps.get("today_buy_allowed", False)
+            ps_warn = ps.get("price_strategy_warning", "")
+
+            stop_str = (_fmt_price(stop, is_kr) if stop else "미산출")
+            t1_str   = (_fmt_price(t1, is_kr) if t1 else "미산출")
+            t2_str   = (_fmt_price(t2, is_kr) if t2 else "미산출")
+            up_str   = (f"+{up1:.1f}%~+{up2:.1f}%" if up1 and up2 else (f"+{up1:.1f}%" if up1 else "?"))
+            down_str = f"{down:.1f}%" if down is not None else "?"
+            rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
+
+            # Today action
+            model_acc = c.get("model_accuracy")
+            if c.get("_sharp_drop_flag"):
+                action = "급락 진입 금지"
+            elif grade not in ("A", "B"):
+                action = "관찰만 / 매수 0원"
+            elif model_acc is not None and model_acc < 30:
+                action = "관찰만 / 정확도 낮음"
+            elif vr < 1.0:
+                action = "진입 보류"
+            elif c.get("_news_missing"):
+                action = "뉴스 확인 후 검토"
+            elif calc_rr and calc_rr < 1.5:
+                action = "손익비 부족"
+            elif buy_allowed:
+                action = "B 승격 후 소액 검토"
+            else:
+                action = "관찰만 / 매수 0원"
+
+            lines.append(
+                f"| {ticker} | {price_str} | {obs[:25]} | {stop_str} "
+                f"| {t1_str} | {t2_str} | {up_str} | {down_str} | {rr_str} | {action} |"
+            )
+
+        # ── 가격전략 검증 ────────────────────────────────────────────────────────
+        lines.append("")
+        lines.append("🧪 신규 후보 가격전략 검증")
+        lines.append("")
+        lines.append("| 항목 | 값 | 판단 |")
+        lines.append("|------|-----|------|")
+        ps_valid  = qc.get("price_strategy_valid_count", 0)
+        ps_inv    = qc.get("price_strategy_invalid_count", len(top))
+        buy_ok    = qc.get("buy_allowed_count", 0)
+        zero_buy  = qc.get("zero_buy_amount_count", len(top))
+        inv_rr    = qc.get("invalid_rr_count", 0)
+        miss_ps   = qc.get("missing_price_strategy_count", 0)
+        n_news    = qc.get("news_missing_count", 0)
+        n_top     = len(top)
+        total_buy = sum((c.get("price_strategy") or {}).get("recommended_buy_amount", 0) for c in top)
+
+        lines.append(f"| 가격전략 생성 후보 수 | {n_top} | {'정상' if miss_ps==0 else f'⚠️ {miss_ps}개 미생성'} |")
+        lines.append(f"| 가격전략 유효 후보 수 | {ps_valid} | {'정상' if ps_valid > 0 else '주의 — 전략 재검토'} |")
+        lines.append(f"| 가격전략 오류 후보 수 | {ps_inv} | {'정상' if ps_inv == 0 else f'⚠️ {ps_inv}개 오류'} |")
+        lines.append(f"| 오늘 신규 매수 가능 수 | {buy_ok} | {'정상 (매수 0)' if buy_ok == 0 else f'⚠️ {buy_ok}개 매수 가능 — 확인 필요'} |")
+        lines.append(f"| 오늘 신규 매수금액 합계 | {total_buy:,}원 | {'정상' if total_buy == 0 else f'⚠️ {total_buy:,}원 — 검증 필요'} |")
+        lines.append(f"| C등급 후보 매수금액 | 0원 | 정상 — C등급 전부 관찰 전용 |")
+        lines.append(f"| 뉴스 미수집 후보 수 | {n_news} | {'뉴스 미연결 — A/B 승격 차단' if n_news > 0 else '정상'} |")
+        lines.append(f"| 단일소스 후보 수 | {n_top} | 단일소스 — A/B 승격 차단 |")
+        lines.append(f"| RR<1.5 후보 수 | {inv_rr} | {'정상' if inv_rr == 0 else f'⚠️ {inv_rr}개 — 손익비 부족'} |")
+
+        # ── 매수 전환 조건 (후보별) ─────────────────────────────────────────────
+        lines.append("")
+        lines.append("신규 후보 매수 전환 조건 (TOP 5)")
+        lines.append("")
+        for c in top[:5]:
+            ticker = c.get("ticker", "?")
+            ps = c.get("price_strategy", {})
+            conds = ps.get("buy_transition_conditions", [])
+            lines.append(f"{ticker}:")
+            for cond in conds:
+                lines.append(f"  - {cond}")
+            if not conds:
+                lines.append("  - 조건 없음 (현재가 미수집 또는 진입 차단)")
+        lines.append("")
 
     lines.append("")
     lines.append("🧪 신규 후보 스크리너 품질 체크")
@@ -632,18 +746,30 @@ def build_screener_report_section(screener_data) -> str:
             return "정상" if val == 0 else f"⚠️ RR<1.0 {val}개 차단됨"
         if key == "volume_condition_mismatch":
             return f"vol<1.3 후보 {val}개 (진입 보류 문구 표시)" if val > 0 else "정상"
+        if key == "price_strategy_valid_count":
+            return f"유효 {val}개" if val > 0 else "전략 재검토 필요"
+        if key == "buy_allowed_count":
+            return "정상 (매수 0)" if val == 0 else f"⚠️ {val}개 매수 가능 — 검증 필요"
+        if key == "zero_buy_amount_count":
+            return f"정상 ({val}개 0원)" if val == len(top) else f"⚠️ {len(top)-val}개 0원 아님"
+        if key == "invalid_rr_count":
+            return "정상" if val == 0 else f"⚠️ {val}개 RR<1.5"
         return str(val)
 
     qc_labels = [
-        ("top5_d_count",           "TOP5 D등급 수"),
-        ("top5_sharp_drop_count",  "TOP5 급락 후보 수"),
-        ("sharp_drop_in_top_count","TOP 전체 급락 수"),
-        ("top_d_count",            "TOP 전체 D등급 수"),
-        ("rr_below_1_excluded",    "RR<1.0 제거 수"),
-        ("volume_condition_mismatch", "거래량 조건 미충족"),
-        ("top_dynamic_count",      "동적 스캔 출신 수"),
-        ("top_fallback_count",     "fallback 출신 수"),
-        ("news_missing_count",     "뉴스 미수집 수"),
+        ("top5_d_count",               "TOP5 D등급 수"),
+        ("top5_sharp_drop_count",      "TOP5 급락 후보 수"),
+        ("sharp_drop_in_top_count",    "TOP 전체 급락 수"),
+        ("top_d_count",                "TOP 전체 D등급 수"),
+        ("rr_below_1_excluded",        "RR<1.0 제거 수"),
+        ("volume_condition_mismatch",  "거래량 조건 미충족"),
+        ("top_dynamic_count",          "동적 스캔 출신 수"),
+        ("top_fallback_count",         "fallback 출신 수"),
+        ("news_missing_count",         "뉴스 미수집 수"),
+        ("price_strategy_valid_count", "가격전략 유효 수"),
+        ("buy_allowed_count",          "오늘 매수 가능 수"),
+        ("zero_buy_amount_count",      "매수금액 0원 수"),
+        ("invalid_rr_count",           "RR<1.5 후보 수"),
     ]
     for key, label in qc_labels:
         val = qc.get(key, 0)
