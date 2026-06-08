@@ -717,59 +717,132 @@ def build_screener_report_section(screener_data) -> str:
     return "\n".join(lines)
 
 
-def _strip_llm_new_candidate_sections(report: str) -> tuple:
+def remove_legacy_llm_candidate_sections(report: str) -> tuple:
     """
-    Post-process the LLM report to remove duplicate/legacy new-candidate sections.
-    Removes: 🧠 퀀트 필터, 💰 매수 가능 금액, and any residual 🎯 신규 수익 발굴 TOP 5 tables.
-    Returns (cleaned_report, list_of_removed_names).
-    Safe: never removes held-portfolio sections (📊, ✅, 📌, ⚠️, 🔍, 📈, etc.).
+    Robustly removes all LLM-generated legacy new-candidate sections from the report.
+    Called BEFORE the code-generated screener section is appended, so the screener
+    section itself is never at risk of deletion.
+
+    Targets (any occurrence, regardless of surrounding table content):
+      1. 🎯 신규 수익 발굴 TOP 5
+      2. 🧪 신규 후보 수치 검증 결과
+      3. 🛑 제외 후보  /  제외 후보 표
+      4. 🧠 퀀트 필터 통과/탈락
+      5. 💰 매수 가능 금액/포지션 크기
+
+    Boundaries (stop removal when one of these lines is reached):
+      📈  ⚠️  🔍  📌
+
+    Returns (cleaned_report, removed_count, removed_titles).
+    Never raises; returns (original_report, 0, []) on exception.
     """
     import re
-    removed = []
 
-    # Boundary: lines starting with these emojis mark the beginning of sections we KEEP.
-    # We stop removing when we hit one of these.
-    KEEP_START = re.compile(r'(?m)^(?=📌|🚦|💼|✅|📰|📊|🎯|📈|⚠️|🔍)')
+    original_report = report
+    removed_titles = []
 
-    def _cut_section(text, head_pattern, label):
-        m = re.search(head_pattern, text)
-        if not m:
-            return text, False
-        s = m.start()
-        # find the next "keep" section boundary AFTER the match end
-        rest = text[m.end():]
-        bm = KEEP_START.search(rest)
-        e = m.end() + (bm.start() if bm else len(rest))
-        removed.append(label)
-        return text[:s].rstrip('\n') + '\n\n' + text[e:].lstrip('\n'), True
+    # Ordered targets: each is a regex that matches the section heading anywhere on a line.
+    # Process in order so that one removal can cascade (e.g. TOP5 → 수치검증 → … all cut at once).
+    TARGETS = [
+        (r'🎯\s*신규\s*수익\s*발굴\s*TOP\s*5',          '신규 수익 발굴 TOP 5'),
+        (r'🧪\s*신규\s*후보\s*수치\s*검증',              '신규 후보 수치 검증 결과'),
+        (r'🛑\s*제외\s*후보',                             '🛑 제외 후보'),
+        (r'(?<!\S)제외\s*후보\s*(?:표|목록)',             '제외 후보 표'),
+        (r'🧠\s*퀀트\s*필터',                             '🧠 퀀트 필터'),
+        (r'💰\s*매수\s*가능\s*금액',                      '💰 매수 가능 금액'),
+    ]
 
-    # 1. Remove 🧠 퀀트 필터 section
-    report, _ = _cut_section(report, r'🧠\s*퀀트\s*필터[^\n]*\n', "🧠 퀀트 필터")
+    # Boundary: a line that starts with one of these emojis → keep this section, stop removal.
+    BOUNDARY_RE = re.compile(r'(?m)^(?=📈|⚠️|🔍|📌)')
 
-    # 2. Remove 💰 매수 가능 금액 section
-    #    After 🧠 removal, 💰 may now border 📈 or ⚠️
-    report, _ = _cut_section(report, r'💰\s*매수\s*가능\s*금액[^\n]*\n', "💰 매수 가능 금액")
+    try:
+        for pat, label in TARGETS:
+            target_re = re.compile(r'(?m)^[^\n]*' + pat + r'[^\n]*', re.IGNORECASE)
+            m = target_re.search(report)
+            if not m:
+                continue
 
-    # 3. Collapse any residual 🎯 TOP 5 TABLE (multi-row pipe table after the heading).
-    #    If the LLM ignored the instruction and made a table, replace with a short note.
-    m5 = re.search(r'(🎯\s*신규\s*수익\s*발굴\s*TOP\s*5[^\n]*\n)', report)
-    if m5:
-        # count table rows after the heading
-        after_head = report[m5.end():]
-        rows = [l for l in after_head.split('\n') if l.startswith('|') and '---' not in l]
-        if len(rows) >= 2:
-            # find section boundary
-            bm = KEEP_START.search(after_head)
-            e = m5.end() + (bm.start() if bm else len(after_head))
-            replacement = (
-                "🎯 신규 수익 발굴 요약\n\n"
-                "신규 후보 상세표: 보고서 하단 스크리너 섹션 참고\n"
-                "오늘 신규 매수: 0원\n\n"
-            )
-            report = report[:m5.start()] + replacement + report[e:]
-            removed.append("🎯 신규 수익 발굴 TOP 5 (표 압축)")
+            title_text = m.group().strip()[:80]
+            s = m.start()
 
-    return report, removed
+            # Find end of section: next BOUNDARY line or end of text.
+            # Search in the text after the heading line.
+            after_heading_nl = report.find('\n', m.end())
+            search_from = after_heading_nl + 1 if after_heading_nl >= 0 else m.end()
+
+            rest = report[search_from:]
+            bm = BOUNDARY_RE.search(rest)
+
+            if bm:
+                # Align to the start of the boundary line
+                nl_before = rest.rfind('\n', 0, bm.start())
+                e = search_from + (nl_before + 1 if nl_before >= 0 else bm.start())
+            else:
+                e = len(report)
+
+            # Perform removal
+            before = report[:s].rstrip('\n')
+            after = report[e:].lstrip('\n')
+            report = before + ('\n\n' if after else '') + after
+            removed_titles.append(title_text)
+
+    except Exception as _err:
+        print(f"  [POST][WARN] remove_legacy_llm_candidate_sections 예외: {_err}", flush=True)
+        return original_report, 0, []
+
+    return report, len(removed_titles), removed_titles
+
+
+def _check_screener_integrity(report: str) -> list:
+    """
+    Post-processing integrity checks on the final report (after all sections appended).
+    Returns a list of warning strings. Empty list = OK.
+    """
+    import re
+    issues = []
+
+    # 1. Legacy TOP5 and new screener TOP10 both present
+    has_top5 = bool(re.search(r'신규\s*수익\s*발굴\s*TOP\s*5', report, re.IGNORECASE))
+    has_screener_top10 = '신규 수익 발굴 스크리너 TOP 10' in report
+    if has_top5 and has_screener_top10:
+        issues.append("중복: '신규 수익 발굴 TOP 5'와 '스크리너 TOP 10' 동시 존재 — 후처리 실패")
+
+    # 2. NEW CANDIDATE table with 미수집 + RR — only check the LLM-generated portion.
+    #    Screener/TDE code-generated sections are safe; held portfolio tables with
+    #    PWFL 미수집 should NOT trigger this (they have no 순위 column).
+    _screener_marker = '신규 수익 발굴 스크리너 TOP 10'
+    _llm_part = report.split(_screener_marker)[0] if _screener_marker in report else report
+    for tblock in re.findall(r'(?:\|[^\n]+\n)+', _llm_part):
+        # Only flag tables that look like new-candidate ranking tables (have 순위 column)
+        if '미수집' in tblock and 'RR' in tblock and '순위' in tblock:
+            issues.append("데이터 불일치: 신규 후보 순위표에 '미수집' + 'RR' 동시 존재 (현재가 없는 표에 RR 표시)")
+            break
+
+    # 3. 손절가 미정/목표가 미정 + RR 표시 (LLM 부분만 확인)
+    for tblock in re.findall(r'(?:\|[^\n]+\n)+', _llm_part):
+        if ('미정' in tblock) and ('RR' in tblock) and '순위' in tblock:
+            issues.append("데이터 불일치: 신규 후보 순위표에 '미정' + 'RR' 동시 존재 (손절/목표 없는 표에 RR 표시)")
+            break
+
+    # 4. 신규 후보 수치 검증 결과 as separate section (already removed; flag if missed)
+    if '신규 후보 수치 검증 결과' in report:
+        issues.append("잔여 섹션: '신규 후보 수치 검증 결과' 제거 미완료")
+
+    # 5. 퀀트 필터 as separate section
+    if re.search(r'퀀트\s*필터\s*통과', report):
+        issues.append("잔여 섹션: '퀀트 필터 통과/탈락' 제거 미완료")
+
+    # 6. Multiple new-candidate detail tables (pipes with RR column in LLM section)
+    candidate_table_blocks = re.findall(
+        r'(?m)^[^\n]*(?:신규|후보|TOP)[^\n]*\n(?:\|[^\n]+\n)+',
+        report, re.IGNORECASE
+    )
+    # Filter: blocks with both 순위 and RR columns = detailed table
+    detailed = [b for b in candidate_table_blocks if '순위' in b and 'RR' in b]
+    if len(detailed) >= 2:
+        issues.append(f"중복 표: 신규 후보 상세표가 {len(detailed)}개 존재")
+
+    return issues
 
 
 def _screener_context_for_llm(screener_data) -> str:
@@ -4064,16 +4137,20 @@ def run_daily_report():
     except Exception as e:
         print(f"  learning_log 저장 실패: {e}", flush=True)
 
-    # LLM 중복 신규 후보 섹션 제거 (퀀트 필터, 매수 가능 금액, 기존 TOP5 표)
+    # LLM 구버전 신규 후보 섹션 강제 제거 (TOP5 표, 수치검증, 퀀트필터, 매수금액 등)
     try:
         if isinstance(report, str):
-            report, _stripped = _strip_llm_new_candidate_sections(report)
-            if _stripped:
-                print(f"  [SCREENER] LLM 중복 섹션 제거: {_stripped}", flush=True)
+            _before_len = len(report)
+            report, _rm_cnt, _rm_titles = remove_legacy_llm_candidate_sections(report)
+            _after_len = len(report)
+            if _rm_cnt:
+                print(f"  [POST] Removed legacy LLM candidate sections: {_rm_cnt}", flush=True)
+                print(f"  [POST] Removed titles: {', '.join(_rm_titles)}", flush=True)
+                print(f"  [POST] Report length: {_before_len} → {_after_len} ({_before_len - _after_len:+d}자)", flush=True)
             else:
-                print(f"  [SCREENER] LLM 중복 섹션 없음 (정상)", flush=True)
+                print(f"  [POST] No legacy LLM candidate sections found (정상)", flush=True)
     except Exception as _spe:
-        print(f"  [SCREENER][WARN] 중복 섹션 제거 실패: {_spe}", flush=True)
+        print(f"  [POST][WARN] 후처리 실패: {_spe}", flush=True)
 
     # 스크리너 섹션을 보고서 하단에 추가 (코드 생성 — LLM 본문 훼손 없음)
     try:
@@ -4120,6 +4197,19 @@ def run_daily_report():
             print(f"  [TDE][WARN] report가 문자열이 아님 — TDE 섹션 추가 생략 (type={type(report)})", flush=True)
     except Exception as _te:
         print(f"  [TDE][WARN] TDE 섹션 추가 실패: {_te}", flush=True)
+
+    # 최종 보고서 무결성 검사 (모든 섹션 추가 완료 후)
+    try:
+        if isinstance(report, str):
+            _integrity_issues = _check_screener_integrity(report)
+            if _integrity_issues:
+                print(f"  [POST-CHECK] ⚠️ 스크리너 무결성 경고 {len(_integrity_issues)}건:", flush=True)
+                for _issue in _integrity_issues:
+                    print(f"    - {_issue}", flush=True)
+            else:
+                print(f"  [POST-CHECK] 스크리너 무결성 OK", flush=True)
+    except Exception as _ce:
+        print(f"  [POST-CHECK][WARN] 무결성 검사 실패: {_ce}", flush=True)
 
     print(f"\n이메일 발송", flush=True)
     _force = os.environ.get("FORCE_SEND_REPORT", "").lower() == "true"
