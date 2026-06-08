@@ -1,0 +1,56 @@
+# .github/workflows/chief_ai.yml
+# 총괄 AI — 매일 자동 실행 + 수동 실행 가능
+# 기존 daily_report.yml과 완전히 독립된 별도 workflow
+
+name: Chief AI — Daily Summary
+
+on:
+  # 매일 KST 07:30 자동 실행 (UTC 22:30, 전날 기준)
+  schedule:
+    - cron: '30 22 * * *'
+
+  # 수동 실행 가능 (GitHub Actions 탭에서 Run workflow 버튼)
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: '테스트 모드 (텔레그램 테스트 메시지만 발송)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  run-chief-ai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 레포 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 총괄 AI 실행
+        env:
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 수동 실행 시 test_mode 입력값 사용, 자동 실행 시 false
+          CHIEF_TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+        run: python chief_ai.py
+
+      - name: 실행 결과 확인
+        if: always()
+        run: |
+          echo "=== agent_status.json ==="
+          cat agent_status.json | python -m json.tool | head -30
+          echo "=== chief_ai_log.json ==="
+          cat logs/chief_ai_log.json | python -m json.tool | tail -20
