@@ -17,6 +17,12 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 try:
+    from learning_engine import run_learning_cycle
+    LEARNING_ENGINE_OK = True
+except ImportError:
+    LEARNING_ENGINE_OK = False
+
+try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
 except ImportError:
@@ -676,7 +682,7 @@ def build_screener_report_section(screener_data) -> str:
                 action = "관찰만 / 매수 0원"
 
             lines.append(
-                f"| {ticker} | {price_str} | {obs[:25]} | {stop_str} "
+                f"| {ticker} | {price_str} | {obs} | {stop_str} "
                 f"| {t1_str} | {t2_str} | {up_str} | {down_str} | {rr_str} | {action} |"
             )
 
@@ -816,7 +822,7 @@ def build_screener_report_section(screener_data) -> str:
         lines.append("오늘 신규 후보 관찰: 없음 — 스크리너 재실행 필요")
     lines.append("")
     lines.append("매수 전환 조건 (전부 충족 시):")
-    lines.append("  1. 모델 정확도 30% 이상 회복")
+    lines.append("  1. 모델 정확도 70% 이상 (30% 미만 = 완전 금지, 30~69% = 관찰/축소만 가능)")
     lines.append("  2. 뉴스/이벤트 2차 데이터소스 연결")
     lines.append("  3. 후보 RR 1.5 이상 유지")
     lines.append("  4. 거래량 조건 충족 (vol ratio 1.3x 이상)")
@@ -2950,6 +2956,63 @@ def detect_tde_llm_conflicts(report, tde_results, price_trigger_results=None):
                     ),
                 })
 
+    # 6. "모델 정확도 30% 이상"을 신규 매수 전환 기준으로 사용하는 표현 충돌
+    _ACC30_BUY_PATS = [
+        r"모델\s*정확도\s*30%?\s*이상[^\n]{0,30}(매수|전환|가능|허용)",
+        r"정확도\s*30%?\s*이상[^\n]{0,20}(신규|매수|전환)",
+        r"30%?\s*이상\s*회복[^\n]{0,20}(매수|전환|가능)",
+    ]
+    for _pat in _ACC30_BUY_PATS:
+        _m = _re.search(_pat, report)
+        if _m:
+            _ctx = report[max(0, _m.start()): _m.end() + 10]
+            if not _re.search(r"금지|불가|관찰만", _ctx):
+                conflicts.append({
+                    "type": "정확도 기준 충돌 (30% vs 70%)",
+                    "detail": (
+                        "본문에 '모델 정확도 30% 이상'을 신규 매수 전환 기준으로 사용하는 표현이 있습니다. "
+                        "30%는 완전 금지 → 관찰 가능으로 올라오는 최소 기준이며, "
+                        "실제 신규 매수 전환 기준은 '모델 정확도 70% 이상'입니다."
+                    ),
+                })
+            break
+
+    # 7. 신규 목돈 매수 금지 상태인데 DCA와 구분 없이 매수 가능처럼 표현
+    if ab_count == 0:
+        for _line in report.splitlines():
+            if any(_dw in _line for _dw in {"금지", "불가", "DCA", "적립", "자동"}):
+                continue
+            if _re.search(r"(신규\s*매수|목돈\s*매수)[^\n]{0,20}가능", _line):
+                conflicts.append({
+                    "type": "DCA/목돈 매수 미구분 충돌",
+                    "detail": (
+                        "신규 목돈 매수 A/B 후보 0개 상태에서 자동 적립(DCA)과 구분 없이 "
+                        "'신규 매수 가능' 표현이 사용됐습니다. "
+                        "'자동 적립 DCA만 유지, 신규 목돈 매수 금지'로 명확히 구분해야 합니다."
+                    ),
+                })
+                break
+
+    # 8. C등급 후보를 관찰 전용이라 하면서 다른 문맥에서 매수 가능처럼 표현
+    _c_grade_buy_pats = [
+        r"C등급[^\n]{0,30}(매수\s*가능|매수\s*추천|소액\s*매수|진입\s*가능)",
+        r"(매수\s*가능|신규\s*진입)[^\n]{0,30}C등급",
+    ]
+    for _pat in _c_grade_buy_pats:
+        for _line in report.splitlines():
+            if any(_dw in _line for _dw in {"금지", "불가", "관찰", "전용"}):
+                continue
+            if _re.search(_pat, _line):
+                conflicts.append({
+                    "type": "C등급 매수 표현 충돌",
+                    "detail": (
+                        "C등급 후보는 관찰 전용(매수 금지)인데 "
+                        "본문 일부에서 매수 가능/진입 가능처럼 표현됐습니다. "
+                        "C등급은 항상 '관찰 전용, 매수 실행 금지'로 통일해야 합니다."
+                    ),
+                })
+                break
+
     return conflicts
 
 
@@ -3496,7 +3559,7 @@ LLM은 신규 후보 표·수치를 직접 생성하지 마라. 현재가·RR·�
 
 - 오늘 스크리너 TOP 후보: [user_content의 스크리너 결과에서 종목명 최대 5개 나열] — 전부 C등급 관찰 후보
 - 오늘 신규 매수: 0원 (A/B 후보 없음 / 모델 정확도 기준)
-- 매수 전환 조건: 모델 정확도 30% 이상 + 뉴스 데이터 연결 + 거래량 1.3x 이상 + 등급 B 승격
+- 매수 전환 조건: 모델 정확도 70% 이상 + 뉴스/이벤트 2차 데이터소스 연결 + 거래량 1.3x 이상 + 후보 등급 B 이상
 
 상세 후보표·품질체크·진입판단: 보고서 하단 코드 생성 섹션 참고
 
@@ -3526,7 +3589,7 @@ LLM은 신규 후보 표·수치를 직접 생성하지 마라. 현재가·RR·�
 | 단일 종목 집중 | 종목명 X% | 20%/25% | 정상/경고 |
 | 손실 중인 종목 | N개 / X% 손실 | - | - |
 | 현금 비중 | X% | 5%/10% | 정상/부족 |
-| 모델 정확도 | X% | 30%/50% | 정상/저하/경보 |
+| 모델 정확도 | X% | 70%/30% | 70%↑=제한적 매수 검토 / 30~69%=관찰만 / 30%↓=완전 금지 |
 | 시장 위험도 | VIX/거시 | - | 낮음/중간/높음 |
 | 가격 조건 발동 | N개 종목 | - | 있음/없음 |
 
@@ -4152,6 +4215,45 @@ def run_daily_report():
     except Exception as _se:
         print(f"  → 스크리너 결과 로드 실패: {_se}", flush=True)
 
+    # 자가학습 사이클 실행 (보고서 생성 전)
+    _learning_result = {"summary_text": "", "adjustments": [], "consistency_issues": [], "error": "미실행"}
+    try:
+        if LEARNING_ENGINE_OK:
+            print(f"\n[LEARNING-ENGINE] 자가학습 사이클 실행", flush=True)
+            _model_acc_val = None
+            try:
+                _p20_local = p20 if isinstance(locals().get("p20"), dict) else {}
+                _ma_raw = _p20_local.get("전체승률")
+                _model_acc_val = float(_ma_raw) if _ma_raw not in (None, "N/A") else None
+            except Exception:
+                pass
+
+            _learning_result = run_learning_cycle(
+                portfolio=portfolio_data,
+                all_stock_data={**us_data, **kr_data},
+                tde_results=tde_results if "tde_results" in dir() else [],
+                price_trigger_results=price_trigger_results if "price_trigger_results" in dir() else [],
+                screener_data=screener_data,
+                model_accuracy=_model_acc_val,
+            )
+            _le_err = _learning_result.get("error")
+            if _le_err:
+                print(f"  [LEARNING-ENGINE][WARN] {_le_err}", flush=True)
+            else:
+                _le_adj = len(_learning_result.get("adjustments", []))
+                _le_out = len(_learning_result.get("outcomes", []))
+                _le_ci  = len(_learning_result.get("consistency_issues", []))
+                print(f"  [LEARNING-ENGINE] outcomes={_le_out}, adjustments={_le_adj}, consistency_issues={_le_ci}", flush=True)
+                if _le_ci:
+                    for _ci in _learning_result.get("consistency_issues", [])[:3]:
+                        print(f"    [CONSISTENCY] {_ci.get('detail','')}", flush=True)
+                if _learning_result.get("decision_log_path"):
+                    print(f"  [LEARNING-ENGINE] decision log → {_learning_result['decision_log_path']}", flush=True)
+        else:
+            print(f"\n[LEARNING-ENGINE] learning_engine.py 미발견 — 자가학습 스킵", flush=True)
+    except Exception as _le:
+        print(f"  [LEARNING-ENGINE][WARN] 자가학습 사이클 오류: {_le}", flush=True)
+
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
                                       macro_data, fear_greed, insider_trades,
@@ -4287,6 +4389,62 @@ def run_daily_report():
     except Exception as _sse:
         print(f"  [SCREENER][WARN] 스크리너 섹션 추가 실패: {_sse}", flush=True)
 
+    # 자가학습 반영 요약 섹션 추가 (summary_text 없으면 fallback 생성)
+    try:
+        if isinstance(report, str):
+            _summary_text = _learning_result.get("summary_text", "")
+            if not _summary_text:
+                # fallback: 로그 파일에서 직접 요약 구성
+                _fb_lines = ["", "🧠 자가학습 반영 요약", ""]
+                _fb_outcomes   = _learning_result.get("outcomes", [])
+                _fb_adjustments = _learning_result.get("adjustments", [])
+                _fb_error      = _learning_result.get("error", "")
+                _fb_evaluated  = [o for o in _fb_outcomes if o.get("tag") not in ("pending_outcome", "data_missing")]
+                _fb_pending    = [o for o in _fb_outcomes if o.get("tag") in ("pending_outcome", "data_missing")]
+                _fb_successes  = [o for o in _fb_evaluated if o.get("is_success")]
+                _fb_failures   = [o for o in _fb_evaluated if o.get("is_failure")]
+                _fb_model_acc  = _learning_result.get("model_accuracy")
+                _acc_str = f"{_fb_model_acc:.1f}%" if _fb_model_acc is not None else "미수집"
+                _acc_note = (
+                    "완전 금지 구간" if (_fb_model_acc is not None and _fb_model_acc < 30)
+                    else "관찰/축소 운용만 가능" if (_fb_model_acc is not None and _fb_model_acc < 70)
+                    else "제한적 신규 매수 검토 가능" if (_fb_model_acc is not None and _fb_model_acc < 80)
+                    else "실전 참고 가능" if (_fb_model_acc is not None and _fb_model_acc < 90)
+                    else "강한 참고 가능" if _fb_model_acc is not None
+                    else "데이터 미수집"
+                )
+                _origin_note = (
+                    "자가학습 로그 생성 완료, 평가 누적 대기" if not _fb_error
+                    else f"첫 실행 또는 평가 가능한 전일 판단 부족 ({_fb_error})"
+                ) if len(_fb_evaluated) == 0 else ""
+
+                _fb_lines.append("| 구분 | 값 | 판단 |")
+                _fb_lines.append("|------|-----|------|")
+                _total_prev = len(_learning_result.get("prev_decisions", []))
+                _hold_prev  = sum(1 for d in _learning_result.get("prev_decisions", []) if d.get("holding_status", True))
+                _cand_prev  = _total_prev - _hold_prev
+                _fb_lines.append(f"| 전일 판단 수 | {_total_prev} | {'정상' if _total_prev > 0 else '기록 없음 — 첫 실행 또는 전일 로그 미존재'} |")
+                _fb_lines.append(f"| 전일 보유종목 판단 | {_hold_prev} | {'정상' if _hold_prev > 0 else '기록 없음'} |")
+                _fb_lines.append(f"| 전일 신규후보 판단 | {_cand_prev} | {'정상' if _cand_prev > 0 else '기록 없음'} |")
+                _fb_lines.append(f"| 평가 완료 수 | {len(_fb_evaluated)} | {_origin_note if _origin_note else '—'} |")
+                _fb_lines.append(f"| 성공 수 | {len(_fb_successes)} | {'양호' if len(_fb_successes) >= len(_fb_failures) else '주의'} |")
+                _fb_lines.append(f"| 실패 수 | {len(_fb_failures)} | {'⚠️ 개선 필요' if _fb_failures else '정상'} |")
+                _fb_lines.append(f"| 평가 보류 수 | {len(_fb_pending)} | {'1일 이상 추적 필요' if _fb_pending else '없음'} |")
+                _fb_lines.append(f"| 모델 정확도 | {_acc_str} | {_acc_note} |")
+                _fb_lines.append(f"| 오늘 반영된 패턴 수 | {len(_fb_adjustments)} | {'패턴 조정 적용됨' if _fb_adjustments else '패턴 없음 — 누적 대기'} |")
+                _fb_lines.append(f"| 신규 후보 점수 반영 | {'반영됨' if _fb_adjustments else '반영 제한적'} | {'정상' if _fb_adjustments else '신규 후보 점수 반영 제한적 — 패턴 누적 필요'} |")
+                _fb_lines.append(f"| 보유 종목 판단 반영 | {'반영됨' if _hold_prev > 0 else '반영 제한적'} | {'정상' if _hold_prev > 0 else '보유 종목 판단 반영 제한적 — 전일 데이터 누적 필요'} |")
+                _fb_lines.append("")
+                if _origin_note:
+                    _fb_lines.append(f"참고: {_origin_note}")
+                    _fb_lines.append("")
+                _summary_text = "\n".join(_fb_lines)
+                print(f"  [LEARNING-ENGINE] fallback 자가학습 요약 생성 완료", flush=True)
+            report = report + "\n\n" + _summary_text
+            print(f"  [LEARNING-ENGINE] 자가학습 반영 요약 섹션 추가 완료", flush=True)
+    except Exception as _les:
+        print(f"  [LEARNING-ENGINE][WARN] 요약 섹션 추가 실패: {_les}", flush=True)
+
     # TDE 섹션을 보고서 하단에 추가 (코드가 직접 생성 — LLM 본문 훼손 없음)
     try:
         if isinstance(report, str):
@@ -4298,17 +4456,22 @@ def run_daily_report():
             if _conflicts:
                 _conf_lines = [
                     "", "⚠️ TDE/LLM 충돌 검증", "",
-                    "| 충돌 항목 | 내용 |", "| --- | --- |",
+                    "| 충돌 항목 | 발견 문구/상황 | 기준 | 판단 |",
+                    "| --- | --- | --- | --- |",
                 ]
                 for _c in _conflicts:
-                    _conf_lines.append(f"| {_c['type']} | {_c['detail']} |")
+                    _conf_lines.append(
+                        f"| {_c['type']} | {_c.get('found', '—')} "
+                        f"| {_c.get('standard', '규칙 위반')} | {_c['detail']} |"
+                    )
                 tde_section = tde_section + "\n" + "\n".join(_conf_lines)
                 print(f"  [TDE][CONFLICT] 충돌 {len(_conflicts)}건 감지", flush=True)
             else:
                 tde_section = (
                     tde_section
                     + "\n\n⚠️ TDE/LLM 충돌 검증\n\n"
-                    + "충돌 없음 — TDE와 LLM 본문 판단이 일치합니다."
+                    + "충돌 없음 — TDE와 LLM 본문 판단이 일치합니다.\n\n"
+                    + "검증 기준: 모델 정확도/후보등급/매수금액/가격조건/DCA 구분 확인 완료"
                 )
 
             # 가격 조건 발동 검증표 추가
