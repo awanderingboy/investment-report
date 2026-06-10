@@ -550,6 +550,52 @@ def load_latest_candidate_screener_results():
         return None
 
 
+_LEGACY_COND_REPLACEMENTS = [
+    (
+        "모델 정확도 30% 이상 회복",
+        "모델 정확도 70% 이상 + 뉴스/이벤트 2차 데이터소스 연결 + 거래량 1.3x 이상 + 후보 등급 B 이상",
+    ),
+    (
+        "모델 정확도 30%",
+        "모델 정확도 70%",
+    ),
+    (
+        "30% 이상 회복",
+        "70% 이상 달성",
+    ),
+]
+
+def _sanitize_screener_legacy_conditions(screener_data: dict) -> dict:
+    """
+    Returns a shallow-copied screener_data with legacy 30%-accuracy buy
+    condition strings replaced in-memory.  Never writes to disk.
+    """
+    import copy as _copy
+    data = _copy.copy(screener_data)
+    top = data.get("top_candidates")
+    if not isinstance(top, list):
+        return data
+    new_top = []
+    for c in top:
+        c2 = _copy.copy(c)
+        ps = c2.get("price_strategy")
+        if isinstance(ps, dict):
+            conds = ps.get("buy_transition_conditions")
+            if isinstance(conds, list):
+                new_conds = []
+                for cond in conds:
+                    if isinstance(cond, str):
+                        for old, new in _LEGACY_COND_REPLACEMENTS:
+                            cond = cond.replace(old, new)
+                    new_conds.append(cond)
+                ps2 = _copy.copy(ps)
+                ps2["buy_transition_conditions"] = new_conds
+                c2["price_strategy"] = ps2
+        new_top.append(c2)
+    data["top_candidates"] = new_top
+    return data
+
+
 def build_screener_report_section(screener_data) -> str:
     """
     Builds the code-generated screener section appended after the LLM report.
@@ -563,6 +609,7 @@ def build_screener_report_section(screener_data) -> str:
             "데이터 없음 — 신규 후보 관찰: D / 불가\n"
         )
 
+    screener_data = _sanitize_screener_legacy_conditions(screener_data)
     top = screener_data.get("top_candidates", [])
     meta = screener_data.get("meta", {})
     qc = meta.get("quality_check", {})
