@@ -1179,7 +1179,89 @@ def _screener_context_for_llm(screener_data) -> str:
         "단일소스/모델 정확도 제한으로 A/B 매수 후보 없음. "
         "섹션 5에서 C 관찰 후보로만 표시하고 매수금액 0원으로 유지하세요."
     )
+
+    # _fdc(final_decision_context)가 있으면 코드 검증 기준을 LLM에 명시 주입
+    _fdc = screener_data.get("_fdc") or {}
+    if _fdc:
+        _is_stale  = _fdc.get("screener_stale", False)
+        _obs_g     = _fdc.get("new_candidate_obs_grade_override") or ("D" if _is_stale else "C")
+        _obs_r     = _fdc.get("new_candidate_obs_reason_override") or ("stale 캐시 — 가격 미확정" if _is_stale else "단일소스/검증 필요")
+        _show_rr   = _fdc.get("show_stop_target_rr", not _is_stale)
+        _buy_cond  = _fdc.get("buy_transition_condition_text",
+                               "모델 정확도 70% 이상 + 뉴스/이벤트 2차 데이터소스 연결 + 거래량 1.3x 이상 + 후보 등급 B 이상")
+        lines += [
+            "",
+            "[코드 검증 기준 — 신규 후보 판단, 이 값 우선 적용]",
+            f"- 스크리너 stale: {_is_stale}",
+            f"- 신규 수익 후보 관찰 등급: {_obs_g} (이유: {_obs_r})",
+            "- 신규 매수 실행 등급: D",
+            "- 신규 후보 자동매매 봇 연결 등급: D",
+            "- 이 D등급은 '보고서를 자동매매 시스템/신규 주문 봇에 직접 연결하지 말라'는 의미다.",
+            "- 기존 보유 종목의 자동 적립(DCA) 판단과는 별개다.",
+            "- VOO/GOOGL/FCX 같은 기존 DCA 적립 유지 여부는 TDE 코드 섹션의 '자동 적립(DCA) 가능 종목' 판단을 우선 따른다.",
+            "- 즉, 신규 자동매매 봇 연결은 D지만, 기존 DCA 적립은 TDE가 허용하면 유지 가능하다.",
+            "- 오늘 신규 매수금액: 0원",
+            f"- 손절/목표/RR 표시 가능: {_show_rr}  (False이면 미확정(stale) 또는 ?로 표시)",
+            f"- 매수 전환 조건: {_buy_cond}",
+            "- 이 기준은 신규 후보/스크리너/신규 목돈 매수/신규 자동매매 봇 연결 등급에만 적용한다.",
+            "- 보유 종목 액션, 가격 조건 발동, 손실 제한 판단, 기존 DCA 자동 적립 판단에는 적용하지 않는다.",
+            "- 기존 DCA 자동 적립 판단은 TDE 코드 결과를 우선한다.",
+        ]
+
     return "\n".join(lines)
+
+
+def _patch_usage_grade_rows(report: str, fdc: dict) -> str:
+    """
+    '🚦 오늘 보고서 실전 사용 등급' 표(상단 LLM 생성)의 신규 관련 3행을
+    _fdc 기준으로 강제 보정한다.  count=1로 첫 번째(상단 표)만 교체.
+    하단 코드 생성 스크리너 등급표는 건드리지 않는다.
+    보유 포트폴리오 관리 / 손실 제한 판단 / 수익 실현/익절 판단 행은 절대 수정하지 않는다.
+    """
+    import re as _re
+
+    obs_g_override = fdc.get("new_candidate_obs_grade_override")
+    if obs_g_override is None:
+        # _fdc가 등급을 강제하지 않는 상황 (stale 아님 + acc_band 정상) → 패치 불필요
+        return report
+
+    obs_s = fdc.get("new_candidate_obs_status_override") or "불가"
+    obs_r = fdc.get("new_candidate_obs_reason_override") or "코드 검증 기준 미충족"
+    buy_exec_reason = "A/B 후보 0개 / 모델 정확도 기준 미충족"
+
+    patched = []
+    replacements = {
+        "신규 수익 후보 관찰": f"| 신규 수익 후보 관찰 | {obs_g_override} | {obs_s} | {obs_r} |",
+        "신규 매수 실행":     f"| 신규 매수 실행 | D | 불가 | {buy_exec_reason} |",
+        "자동매매 연결":      "| 자동매매 연결 | D | 불가 | 사용자 수동 확인 필수 |",
+    }
+    hit_count = {k: 0 for k in replacements}
+
+    for line in report.splitlines():
+        replaced = False
+        for key, new_line in replacements.items():
+            if f"| {key} |" in line and hit_count[key] == 0:
+                # 상단 LLM 표(첫 번째 등장)만 교체
+                # 하단 코드 생성 스크리너 섹션 헤더("신규 후보 스크리너 연동 실전 사용 등급") 이후는
+                # 이미 hit_count >= 1이 되거나 다른 컬럼 구조라서 교체 안 됨
+                if line.strip() != new_line.strip():
+                    print(f"  [FDC-PATCH] 교체: '{line.strip()[:60]}' → '{new_line.strip()[:60]}'", flush=True)
+                hit_count[key] += 1
+                patched.append(new_line)
+                replaced = True
+                break
+            elif f"| {key} |" in line:
+                hit_count[key] += 1
+        if not replaced:
+            patched.append(line)
+
+    _total_patched = sum(1 for k in replacements if hit_count[k] > 0)
+    if _total_patched == 0:
+        print("  [FDC-PATCH][WARN] 상단 등급 표 행을 찾지 못함 — 원본 유지", flush=True)
+    else:
+        print(f"  [FDC-PATCH] 상단 등급 표 {_total_patched}행 보정 완료", flush=True)
+
+    return "\n".join(patched)
 
 
 # ── 환율 조회 ─────────────────────────────────────────────────────────────────
@@ -4381,7 +4463,7 @@ def run_daily_report():
             _top_cnt = len(screener_data.get("top_candidates", []))
             _sdate = screener_data.get("date", "?")
             print(f"  → 스크리너 결과 로드 완료: {_top_cnt}개 후보 / 날짜={_sdate}", flush=True)
-            screener_context = _screener_context_for_llm(screener_data)
+            # screener_context 계산은 _fdc 생성 이후로 이동 (아래 FDC 블록 참고)
         else:
             print("  → 스크리너 결과 없음 (outputs/top_candidates_*.json 미존재)", flush=True)
     except Exception as _se:
@@ -4444,6 +4526,15 @@ def run_daily_report():
         _fdc = {}
         print(f"  [FDC][WARN] final_decision_context 생성 실패: {_fdc_e}", flush=True)
 
+    # screener_context: _fdc 주입 완료 후 계산 (LLM이 _fdc 기준을 user_content에서 볼 수 있도록)
+    try:
+        if screener_data is not None:
+            screener_context = _screener_context_for_llm(screener_data)
+            print(f"  [SCREENER] screener_context 생성 완료 ({len(screener_context)}자, _fdc 포함)", flush=True)
+    except Exception as _sce:
+        screener_context = None
+        print(f"  [SCREENER][WARN] screener_context 생성 실패: {_sce}", flush=True)
+
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
                                       macro_data, fear_greed, insider_trades,
@@ -4452,6 +4543,12 @@ def run_daily_report():
                                       price_trigger_str=price_trigger_str,
                                       screener_context=screener_context)
     print(f"  → 보고서 생성 완료 ({len(report)}자)", flush=True)
+
+    # 상단 실전 사용 등급 후처리 — _fdc 기준으로 신규 관련 3행 보정
+    try:
+        report = _patch_usage_grade_rows(report, _fdc)
+    except Exception as _patch_e:
+        print(f"  [FDC-PATCH][WARN] 후처리 실패: {_patch_e}", flush=True)
 
     # 목표가/손절가 portfolio.json에 자동 저장
     try:
