@@ -1,7 +1,7 @@
 {
   "exchange_rate_note": "달러 종목은 달러 기준으로 저장",
   "cash": {
-    "krw": 12839062,
+    "krw": 8419062,
     "usd": 447
   },
   "category1": [
@@ -58,8 +58,8 @@
     {
       "ticker": "035420.KS",
       "name": "네이버",
-      "shares": 50,
-      "avg_price": 214000,
+      "shares": 70,
+      "avg_price": 216000,
       "currency": "KRW",
       "target_price": 220000.0,
       "stop_loss": 40150.0
@@ -153,6 +153,15 @@
     }
   ],
   "executed_actions": [
+    {
+      "date": "2026-06-10",
+      "action": "매수",
+      "ticker": "035420.KS",
+      "name": "네이버",
+      "shares": 20,
+      "price_krw": 221000,
+      "memo": "수동 추가매수 반영 (텔레그램 입력 불가로 직접 기록, 단가 221,000원 × 20주 = 4,420,000원)"
+    },
     {
       "date": "2026-05-27",
       "action": "매수",
