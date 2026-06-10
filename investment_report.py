@@ -596,6 +596,79 @@ def _sanitize_screener_legacy_conditions(screener_data: dict) -> dict:
     return data
 
 
+def _build_final_decision_context(
+    tde_results: list,
+    screener_data: dict,
+    model_accuracy,
+) -> dict:
+    """
+    Single source of truth for all new-buy / screener judgment values.
+    Called once in run_daily_report() after tde_results, screener_data,
+    and model_accuracy are all available.  Never mutates its arguments.
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    sdata = screener_data or {}
+    sdate = sdata.get("date", "unknown")
+    is_stale = sdata.get("_stale", False) or (
+        sdate not in ("unknown",) and sdate.replace("-", "") != today
+    )
+
+    # A/B 실행 가능 후보
+    ab_count = sum(
+        1 for t in (tde_results or [])
+        if t["trade_eligibility"]["buy_grade"] in ("A", "B")
+        and t["risk_reward"]["valid"]
+        and t["trade_eligibility"]["buy_type"]["lump_sum_buy_allowed"]
+    )
+
+    # 정확도 band
+    ma = model_accuracy
+    if ma is None:
+        acc_band = "unknown"
+    elif ma < 30:
+        acc_band = "ban"
+    elif ma < 70:
+        acc_band = "observe_only"
+    elif ma < 80:
+        acc_band = "limited_review"
+    else:
+        acc_band = "usable"
+
+    # 신규 후보 관찰 등급 — stale > acc_band > ab_count 우선순위
+    if is_stale:
+        obs_grade   = "D"
+        obs_status  = "불가 — stale 캐시"
+        obs_reason  = f"스크리너 데이터 날짜 불일치 (캐시: {sdate}) — 가격 미확정, 실매수 금지"
+    elif acc_band == "ban":
+        obs_grade   = "D"
+        obs_status  = "불가 — 모델 정확도 30% 미만"
+        obs_reason  = f"모델 정확도 {ma:.0f}% — 완전 금지 구간, 관찰도 제한"
+    else:
+        obs_grade  = None   # build_screener_report_section의 기존 계산 유지
+        obs_status = None
+        obs_reason = None
+
+    return {
+        "model_accuracy":                   ma,
+        "accuracy_band":                    acc_band,
+        "screener_stale":                   is_stale,
+        "ab_candidate_count":               ab_count,
+        "new_money_buy_allowed":            ab_count > 0 and not is_stale and acc_band not in ("ban", "observe_only"),
+        "new_buy_amount":                   0,
+        "new_candidate_obs_grade_override": obs_grade,
+        "new_candidate_obs_status_override": obs_status,
+        "new_candidate_obs_reason_override": obs_reason,
+        "new_buy_execution_grade":          "D",
+        "auto_trading_grade":               "D",
+        "buy_transition_condition_text": (
+            "모델 정확도 70% 이상 + 뉴스/이벤트 2차 데이터소스 연결 "
+            "+ 거래량 1.3x 이상 + 후보 등급 B 이상"
+        ),
+        "show_stop_target_rr":              not is_stale,
+        "tde_llm_conflict_count":           0,   # 충돌 감지 후 업데이트
+    }
+
+
 def build_screener_report_section(screener_data) -> str:
     """
     Builds the code-generated screener section appended after the LLM report.
@@ -609,17 +682,21 @@ def build_screener_report_section(screener_data) -> str:
             "데이터 없음 — 신규 후보 관찰: D / 불가\n"
         )
 
+    # _fdc는 sanitize 전에 먼저 보존 (shallow copy 후에도 살아있지만 명시적으로 꺼냄)
+    _fdc = screener_data.get("_fdc") or {}
     screener_data = _sanitize_screener_legacy_conditions(screener_data)
     top = screener_data.get("top_candidates", [])
     meta = screener_data.get("meta", {})
     qc = meta.get("quality_check", {})
     scan_status = screener_data.get("market_scan_status", "unknown")
     data_date = screener_data.get("date", "unknown")
-    is_stale = screener_data.get("_stale", False)
+    is_stale = _fdc.get("screener_stale", screener_data.get("_stale", False))
+    show_stop_target_rr = _fdc.get("show_stop_target_rr", not is_stale)
 
     _today_str = datetime.now().strftime("%Y%m%d")
     if not is_stale and data_date not in ("unknown",) and data_date.replace("-", "") != _today_str:
         is_stale = True
+        show_stop_target_rr = False
 
     lines = []
     lines.append("")
@@ -661,10 +738,16 @@ def build_screener_report_section(screener_data) -> str:
                 if v is None: return "미산출"
                 return f"{v:,.0f}원" if kr else f"${v:.2f}"
 
-            stop_str = _fmt_price(stop, is_kr)
-            t1_str   = _fmt_price(t1, is_kr)
-            up1_str  = f"+{up1:.1f}%" if up1 is not None else "?"
-            rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
+            if show_stop_target_rr:
+                stop_str = _fmt_price(stop, is_kr)
+                t1_str   = _fmt_price(t1, is_kr)
+                up1_str  = f"+{up1:.1f}%" if up1 is not None else "?"
+                rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
+            else:
+                stop_str = "미확정(stale)"
+                t1_str   = "미확정(stale)"
+                up1_str  = "?"
+                rr_str   = "?"
             buy_str  = "0원 (stale)" if is_stale else (f"{buy_amt:,}원" if buy_amt else "0원")
 
             model_acc = c.get("model_accuracy")
@@ -856,14 +939,21 @@ def build_screener_report_section(screener_data) -> str:
         lines.append(f"| {label} | {val} | {_qj(key, val)} |")
     lines.append("")
 
-    # 실전 사용 등급 (스크리너 연동)
+    # 실전 사용 등급 (스크리너 연동) — _fdc override 우선 적용
     top5_d = qc.get("top5_d_count", 0)
     top5_drop = qc.get("top5_sharp_drop_count", 0)
     news_missing = qc.get("news_missing_count", 0)
     dyn_count = qc.get("top_dynamic_count", 0)
     has_enough = len(top) >= 5
 
-    if is_stale:
+    _fdc_obs_grade  = _fdc.get("new_candidate_obs_grade_override")
+    _fdc_obs_status = _fdc.get("new_candidate_obs_status_override")
+    _fdc_obs_reason = _fdc.get("new_candidate_obs_reason_override")
+
+    if _fdc_obs_grade is not None:
+        # final_decision_context가 등급을 결정한 경우 (stale / acc_band == ban)
+        obs_grade, obs_status, obs_reason = _fdc_obs_grade, _fdc_obs_status, _fdc_obs_reason
+    elif is_stale:
         obs_grade, obs_status = "D", "불가 — stale 캐시"
         obs_reason = f"스크리너 데이터 날짜 불일치 (캐시: {data_date}) — 가격 미확정, 실매수 금지"
     elif not has_enough or top5_d > 0 or top5_drop > 0:
@@ -878,6 +968,11 @@ def build_screener_report_section(screener_data) -> str:
     else:
         obs_grade, obs_status = "C", "조건부"
         obs_reason = "fallback 비중 높음"
+
+    # TDE 충돌이 있으면 관찰 등급도 D로 강제
+    if _fdc.get("tde_llm_conflict_count", 0) > 0 and obs_grade != "D":
+        obs_grade, obs_status = "D", "불가 — TDE/LLM 충돌"
+        obs_reason = f"TDE/LLM 충돌 {_fdc['tde_llm_conflict_count']}건 — 수동 확인 필요"
 
     lines.append("신규 후보 스크리너 연동 실전 사용 등급")
     lines.append("")
@@ -4331,6 +4426,24 @@ def run_daily_report():
     except Exception as _le:
         print(f"  [LEARNING-ENGINE][WARN] 자가학습 사이클 오류: {_le}", flush=True)
 
+    # ── final_decision_context 생성 (single source of truth) ──────────────────
+    try:
+        _fdc = _build_final_decision_context(
+            tde_results=tde_results if "tde_results" in dir() else [],
+            screener_data=screener_data,
+            model_accuracy=_model_acc_val,
+        )
+        if screener_data is not None:
+            screener_data["_fdc"] = _fdc
+        print(
+            f"  [FDC] acc_band={_fdc['accuracy_band']} / stale={_fdc['screener_stale']} "
+            f"/ ab={_fdc['ab_candidate_count']} / show_rr={_fdc['show_stop_target_rr']}",
+            flush=True,
+        )
+    except Exception as _fdc_e:
+        _fdc = {}
+        print(f"  [FDC][WARN] final_decision_context 생성 실패: {_fdc_e}", flush=True)
+
     print(f"\n[11/11] AI 분석 보고서 생성", flush=True)
     report, targets = generate_report(us_data, kr_data, exchange_rate,
                                       macro_data, fear_greed, insider_trades,
@@ -4530,6 +4643,9 @@ def run_daily_report():
             tde_section = render_tde_report_section(_tde_list)
             # LLM/TDE 충돌 감지 (가격 조건 발동 충돌 포함)
             _conflicts = detect_tde_llm_conflicts(report, _tde_list, price_trigger_results=_ptr)
+            # _fdc에 충돌 수 반영 (build_screener_report_section은 이미 호출됐으므로 하단 경고용)
+            if isinstance(_fdc, dict):
+                _fdc["tde_llm_conflict_count"] = len(_conflicts)
             if _conflicts:
                 _conf_lines = [
                     "",
