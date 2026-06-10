@@ -756,7 +756,7 @@ def build_candidate_price_strategy(candidate: dict) -> dict:
         buy_conds.append("뉴스/이벤트 2차 데이터소스 연결")
     if vr < 1.3:
         buy_conds.append(f"거래량 1.3x 이상 회복 (현재 {vr:.2f}x)")
-    buy_conds.append("모델 정확도 30% 이상 회복")
+    buy_conds.append("모델 정확도 70% 이상 + 뉴스/이벤트 2차 데이터소스 연결 + 거래량 1.3x 이상 + 후보 등급 B 이상")
     buy_conds.append("등급 C → B 이상으로 승격")
     if calc_rr and calc_rr < 1.5:
         buy_conds.append(f"RR 1.5 이상 확보 (현재 {calc_rr:.2f})")

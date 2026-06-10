@@ -523,6 +523,7 @@ def load_latest_candidate_screener_results():
     Tries today's date first; falls back to the most recent file.
     Returns parsed dict or None on any failure. Never raises.
     Does NOT import or execute candidate_screener.py.
+    Injects _stale=True into the result when today's file is unavailable.
     """
     import glob as _glob
     outputs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
@@ -531,16 +532,20 @@ def load_latest_candidate_screener_results():
 
     if os.path.exists(today_path):
         candidate_path = today_path
+        is_stale = False
     else:
         pattern = os.path.join(outputs_dir, "top_candidates_*.json")
         files = sorted(_glob.glob(pattern), reverse=True)
         if not files:
             return None
         candidate_path = files[0]
+        is_stale = True
 
     try:
         with open(candidate_path, encoding="utf-8") as _f:
-            return json.load(_f)
+            data = json.load(_f)
+        data["_stale"] = is_stale
+        return data
     except Exception:
         return None
 
@@ -563,6 +568,11 @@ def build_screener_report_section(screener_data) -> str:
     qc = meta.get("quality_check", {})
     scan_status = screener_data.get("market_scan_status", "unknown")
     data_date = screener_data.get("date", "unknown")
+    is_stale = screener_data.get("_stale", False)
+
+    _today_str = datetime.now().strftime("%Y%m%d")
+    if not is_stale and data_date not in ("unknown",) and data_date.replace("-", "") != _today_str:
+        is_stale = True
 
     lines = []
     lines.append("")
@@ -571,6 +581,11 @@ def build_screener_report_section(screener_data) -> str:
         f"(데이터 날짜: {data_date} / 시장 스캔: {scan_status} "
         f"/ 후보 수: {len(top)}개 / 실행 시간: {meta.get('elapsed_seconds', '?')}s)"
     )
+    if is_stale:
+        lines.append(
+            f"⚠️ 스크리너 데이터 날짜 불일치 — 캐시 데이터 사용 중 (캐시: {data_date} / 오늘: {_today_str}). "
+            "후보 가격/진입 조건은 미확정이며 신규 매수 0원 유지."
+        )
     lines.append("")
 
     if not top:
@@ -603,10 +618,12 @@ def build_screener_report_section(screener_data) -> str:
             t1_str   = _fmt_price(t1, is_kr)
             up1_str  = f"+{up1:.1f}%" if up1 is not None else "?"
             rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
-            buy_str  = f"{buy_amt:,}원" if buy_amt else "0원"
+            buy_str  = "0원 (stale)" if is_stale else (f"{buy_amt:,}원" if buy_amt else "0원")
 
             model_acc = c.get("model_accuracy")
-            if grade in ("A", "B") and model_acc is not None and model_acc < 30:
+            if is_stale:
+                judgment = "관찰만 / 매수 0원 (stale)"
+            elif grade in ("A", "B") and model_acc is not None and model_acc < 30:
                 judgment = "실행 보류(정확도)"
             elif grade in ("A", "B"):
                 judgment = "매수 후보"
@@ -655,16 +672,26 @@ def build_screener_report_section(screener_data) -> str:
             buy_allowed = ps.get("today_buy_allowed", False)
             ps_warn = ps.get("price_strategy_warning", "")
 
-            stop_str = (_fmt_price(stop, is_kr) if stop else "미산출")
-            t1_str   = (_fmt_price(t1, is_kr) if t1 else "미산출")
-            t2_str   = (_fmt_price(t2, is_kr) if t2 else "미산출")
-            up_str   = (f"+{up1:.1f}%~+{up2:.1f}%" if up1 and up2 else (f"+{up1:.1f}%" if up1 else "?"))
-            down_str = f"{down:.1f}%" if down is not None else "?"
-            rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
+            if is_stale:
+                stop_str = "미확정(stale)"
+                t1_str   = "미확정(stale)"
+                t2_str   = "미확정(stale)"
+                up_str   = "?"
+                down_str = "?"
+                rr_str   = "?"
+            else:
+                stop_str = (_fmt_price(stop, is_kr) if stop else "미산출")
+                t1_str   = (_fmt_price(t1, is_kr) if t1 else "미산출")
+                t2_str   = (_fmt_price(t2, is_kr) if t2 else "미산출")
+                up_str   = (f"+{up1:.1f}%~+{up2:.1f}%" if up1 and up2 else (f"+{up1:.1f}%" if up1 else "?"))
+                down_str = f"{down:.1f}%" if down is not None else "?"
+                rr_str   = f"{calc_rr:.2f}" if calc_rr else "?"
 
             # Today action
             model_acc = c.get("model_accuracy")
-            if c.get("_sharp_drop_flag"):
+            if is_stale:
+                action = "관찰만 / 매수 0원 (stale)"
+            elif c.get("_sharp_drop_flag"):
                 action = "급락 진입 금지"
             elif grade not in ("A", "B"):
                 action = "관찰만 / 매수 0원"
@@ -789,7 +816,10 @@ def build_screener_report_section(screener_data) -> str:
     dyn_count = qc.get("top_dynamic_count", 0)
     has_enough = len(top) >= 5
 
-    if not has_enough or top5_d > 0 or top5_drop > 0:
+    if is_stale:
+        obs_grade, obs_status = "D", "불가 — stale 캐시"
+        obs_reason = f"스크리너 데이터 날짜 불일치 (캐시: {data_date}) — 가격 미확정, 실매수 금지"
+    elif not has_enough or top5_d > 0 or top5_drop > 0:
         obs_grade, obs_status = "D", "불가"
         obs_reason = "스크리너 데이터 없음 또는 TOP5 품질 미달"
     elif news_missing >= max(len(top), 1):
@@ -3806,7 +3836,7 @@ def _report_text_to_html(text: str) -> str:
     lines = text.split('\n')
     out = []
     i = 0
-    EMOJI_STARTS = tuple('📊📈📉💼⭐💡🔴🟠🟡🟢💎⚠️✅❌🚫🔄⏸️📅🌍🏛️📋🔍💰')
+    EMOJI_STARTS = tuple('🧠📊📈📉💼⭐💡🔴🟠🟡🟢💎⚠️✅❌🚫🔄⏸️📅🌍🏛️📋🔍💰')
 
     while i < len(lines):
         line = lines[i]
@@ -4455,7 +4485,11 @@ def run_daily_report():
             _conflicts = detect_tde_llm_conflicts(report, _tde_list, price_trigger_results=_ptr)
             if _conflicts:
                 _conf_lines = [
-                    "", "⚠️ TDE/LLM 충돌 검증", "",
+                    "",
+                    "⚠️ TDE/LLM 충돌 감지 — 신규 매수 관련 문구 수동 확인 필요. "
+                    "실전 사용 등급 강제 하향: 신규 매수 실행 D / 신규 후보 관찰 D / 자동매매 연결 D",
+                    "",
+                    "⚠️ TDE/LLM 충돌 검증", "",
                     "| 충돌 항목 | 발견 문구/상황 | 기준 | 판단 |",
                     "| --- | --- | --- | --- |",
                 ]
