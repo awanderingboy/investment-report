@@ -15,6 +15,8 @@ jobs:
   run-report:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -62,3 +64,13 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_SEND_REPORT: ${{ github.event.inputs.force_send || 'false' }}
         run: python investment_report.py
+
+      - name: Commit send record
+        if: always()
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .sent_reports.json 2>/dev/null || true
+          git diff --staged --quiet && echo "No send record changes" || \
+            git commit -m "chore: update daily send record [skip ci]"
+          git push origin HEAD 2>/dev/null || true

@@ -1,0 +1,37 @@
+{
+  "2026-06-04": {
+    "sent_at": "2026-06-04T16:55:21+09:00",
+    "report_type": "daily",
+    "status": "sent"
+  },
+  "2026-06-05": {
+    "sent_at": "2026-06-05T07:04:44+09:00",
+    "report_type": "daily",
+    "status": "sent"
+  },
+  "2026-06-07": {
+    "sent_at": "2026-06-07T19:43:29+09:00",
+    "report_type": "daily",
+    "status": "sent"
+  },
+  "2026-06-08": {
+    "sent_at": "2026-06-08T18:23:53+09:00",
+    "report_type": "daily",
+    "status": "sent"
+  },
+  "2026-06-09": {
+    "sent_at": "2026-06-09T07:03:41+09:00",
+    "report_type": "daily",
+    "status": "sent"
+  },
+  "2026-06-10": {
+    "sent_at": "2026-06-10T12:57:39+09:00",
+    "report_type": "daily",
+    "status": "sent"
+  },
+  "2026-06-11": {
+    "sent_at": "2026-06-11T12:12:58+09:00",
+    "report_type": "manual_final_resend",
+    "status": "sent"
+  }
+}

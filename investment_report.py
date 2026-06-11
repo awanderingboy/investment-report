@@ -458,18 +458,23 @@ def gmail_report_exists_today(report_type: str = "daily") -> bool:
         "[Gmail]/보낸편지함",
         "[Gmail]/전체보관함",
     ]
-    try:
-        imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        for mb in mailboxes:
-            if _mailbox_has_today_report_by_header(imap, mb, today_date_str):
-                imap.logout()
-                return True
-        imap.logout()
-        return False
-    except Exception as e:
-        print(f"  [SEND-GUARD][WARN] Gmail duplicate check failed — allow send: {e}", flush=True)
-        return False
+    import time as _time
+    for _attempt in range(3):
+        try:
+            imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            for mb in mailboxes:
+                if _mailbox_has_today_report_by_header(imap, mb, today_date_str):
+                    imap.logout()
+                    return True
+            imap.logout()
+            return False  # 연결 성공 + 모든 메일함 검색 후 없음 → 발송 허용
+        except Exception as e:
+            print(f"  [SEND-GUARD][WARN] Gmail check attempt {_attempt+1}/3 failed: {e}", flush=True)
+            if _attempt < 2:
+                _time.sleep(5)
+    print("  [SEND-GUARD][WARN] Gmail duplicate check failed after 3 attempts — allow send", flush=True)
+    return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4102,14 +4107,25 @@ def _report_text_to_html(text: str) -> str:
     return '\n'.join(out)
 
 
-def send_email(report_content):
+def send_email(report_content, subject_suffix="", body_prefix=""):
+    """
+    보고서를 이메일로 발송한다.
+    subject_suffix: 제목 뒤에 붙는 문자열 (예: ' 최종본')
+    body_prefix:    본문 상단에 표시할 안내 문구 (예: 재발송 안내)
+    """
     today        = _report_date_kst_str()
     generated_at = _report_timestamp_kst_str()
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"📈 투자 분석 보고서 — {today}"
+    msg["Subject"] = f"📈 투자 분석 보고서 — {today}{subject_suffix}"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = RECIPIENT_EMAIL
+
+    _notice_html = (
+        f'<div style="background:#fff3cd;padding:12px 16px;margin-bottom:16px;'
+        f'border-left:4px solid #e6ac00;font-size:13px;font-weight:bold;">'
+        f'{body_prefix}</div>'
+    ) if body_prefix else ""
 
     html_body = f"""
     <html>
@@ -4135,6 +4151,7 @@ def send_email(report_content):
                 <p>{today}</p>
                 <p class="data-time">데이터 기준: {generated_at} (한국 주식은 전일 종가 기준)</p>
             </div>
+            {_notice_html}
             {_report_text_to_html(report_content)}
             <div class="footer">
                 <p>본 보고서는 AI 분석 시스템이 자동 생성한 참고 자료입니다. 투자 결정은 본인의 판단과 책임 하에 이루어져야 합니다.</p>
@@ -4795,12 +4812,28 @@ def run_daily_report():
         print(f"  [POST-CHECK][WARN] 무결성 검사 실패: {_ce}", flush=True)
 
     print(f"\n이메일 발송", flush=True)
-    _force = os.environ.get("FORCE_SEND_REPORT", "").lower() == "true"
-    if _force:
+    _force        = os.environ.get("FORCE_SEND_REPORT", "").lower() == "true"
+    _manual_resend = os.environ.get("MANUAL_FINAL_RESEND", "").lower() == "true"
+
+    if _manual_resend:
+        # 사용자 명시 요청에 의한 최종본 재발송 (1회만 허용)
+        print("  [SEND-GUARD] MANUAL_FINAL_RESEND=true — 오늘 최종본 재발송", flush=True)
+        send_email(
+            report,
+            subject_suffix=" 최종본",
+            body_prefix=(
+                "※ 오늘 중복 발송 오류 수정 후 재발송한 최종본입니다. "
+                "이전에 수신한 동일 날짜 보고서보다 이 보고서를 기준으로 확인하세요."
+            ),
+        )
+        mark_sent_today("manual_final_resend")
+    elif _force:
         print("  [SEND-GUARD] FORCE_SEND_REPORT=true — duplicate checks bypassed", flush=True)
-    if not _force and already_sent_today("daily"):
+        send_email(report)
+        mark_sent_today("daily")
+    elif already_sent_today("daily"):
         print("  [SEND-GUARD] already sent today — skip email", flush=True)
-    elif not _force and gmail_report_exists_today("daily"):
+    elif gmail_report_exists_today("daily"):
         print("  [SEND-GUARD] Gmail already has today's report — skip email", flush=True)
     else:
         send_email(report)
