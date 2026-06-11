@@ -3193,24 +3193,34 @@ def detect_tde_llm_conflicts(report, tde_results, price_trigger_results=None):
             break
 
     # 2. 고위험 추매 충돌 — 라인 단위 검사
-    # 같은 라인에 금지/불가/보류/하지 단어가 있으면 충돌 아님
+    # 같은 라인에 부정/금지 단어가 있으면 충돌 아님 (오탐 방지 강화)
     _HIGH_RISK = {"RGTI", "BEAM", "JOBY", "PWFL"}
     _hr_d = {
         t["symbol"] for t in tde_results
         if t["symbol"] in _HIGH_RISK
         and (t["trade_eligibility"]["buy_grade"] == "D" or t["category"] == "유형③")
     }
-    # 충돌 조건: 종목명 라인 + 금지성 단어 없음 + (매수 후보 존재 OR 추매/추가매수 + 가능/허용/진입)
-    _DENY_WORDS_HR = {"금지", "불가", "보류", "하지", "축소", "매도", "유지", "보유"}
-    _TRIGGER_HR    = ["추매", "추가매수", "추가 매수"]
-    _AFFIRM_HR     = ["가능", "허용", "진입", "추천"]
+    # 부정 문맥: 이 단어가 라인에 있으면 충돌 아님
+    _DENY_WORDS_HR = {
+        "금지", "불가", "보류", "하지", "축소", "매도", "유지", "보유",
+        "없음", "관찰", "확인", "미수집", "판단", "관망", "0원", "불가능",
+    }
+    # 긍정 트리거: 추매/추가매수 계열 단어
+    _TRIGGER_HR = ["추매", "추가매수", "추가 매수"]
+    # 긍정 확인 단어: 허용/가능/추천 계열
+    _AFFIRM_HR  = ["가능", "허용", "추천"]  # "진입" 단독은 중립이므로 제거
     for _sym in _hr_d:
         for _line in report.splitlines():
             if _sym not in _line:
                 continue
             if any(_dw in _line for _dw in _DENY_WORDS_HR):
                 continue
-            _has_buy_candidate     = "매수 후보" in _line
+            # "매수 후보" → 부정 컨텍스트(없음/D등급/아님)가 없을 때만 충돌
+            _has_buy_candidate = (
+                "매수 후보" in _line
+                and not any(_dn in _line for _dn in {"없음", "아님", "D등급", "C등급", "불가", "금지"})
+            )
+            # 추매/추가매수 + 가능/허용/추천 조합만 충돌 (부정어 없는 라인에서만)
             _has_trigger_with_affirm = (
                 any(_tr in _line for _tr in _TRIGGER_HR)
                 and any(_af in _line for _af in _AFFIRM_HR)
@@ -3493,16 +3503,16 @@ _PRICE_TRIGGER_CONFIGS = [
     {
         "symbol": "GOOGL", "name": "GOOGL",
         "condition_price": 370, "condition_type": "below_or_equal",
-        "triggered_action": "370달러 이하 도달 — 단, 모델 신뢰도/신규 매수 모드 조건 통과 전까지 목돈 매수 보류",
-        "near_action": "370달러 근접 — 추가 일시매수 조건 감시",
+        "triggered_action": "370달러 이하 도달 — DCA 적립은 유지. 추가 일시매수/목돈 매수는 모델 정확도 회복 전까지 보류.",
+        "near_action": "370달러 근접 — DCA 적립 유지 / 목돈 매수 조건 감시",
         "conflict_phrases": [],
         "affirm_phrases":   [],
     },
     {
         "symbol": "VOO", "name": "VOO",
         "condition_price": 670, "condition_type": "below_or_equal",
-        "triggered_action": "670달러 이하 도달 — 추가 일시매수 조건 충족, RSI/신규 매수 모드 병행 확인",
-        "near_action": "670달러 근접 — 적립재개 조건 감시",
+        "triggered_action": "670달러 이하 도달 — DCA 적립은 유지. 추가 일시매수/목돈 매수는 모델 정확도 회복 전까지 보류.",
+        "near_action": "670달러 근접 — DCA 적립 유지 / 목돈 매수 조건 감시",
         "conflict_phrases": [],
         "affirm_phrases":   [],
     },
