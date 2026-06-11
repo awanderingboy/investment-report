@@ -1202,15 +1202,24 @@ def _screener_context_for_llm(screener_data) -> str:
             "- 신규 매수 실행 등급: D",
             "- 신규 후보 자동매매 봇 연결 등급: D",
             "- 이 D등급은 '보고서를 자동매매 시스템/신규 주문 봇에 직접 연결하지 말라'는 의미다.",
-            "- 기존 보유 종목의 자동 적립(DCA) 판단과는 별개다.",
-            "- VOO/GOOGL/FCX 같은 기존 DCA 적립 유지 여부는 TDE 코드 섹션의 '자동 적립(DCA) 가능 종목' 판단을 우선 따른다.",
-            "- 즉, 신규 자동매매 봇 연결은 D지만, 기존 DCA 적립은 TDE가 허용하면 유지 가능하다.",
+            "- 기존 보유 종목의 자동 적립(DCA) 판단과는 완전히 별개다.",
+            "- VOO/GOOGL/FCX 기존 DCA 자동 적립: TDE 코드에서 허용된 경우 무조건 '적립 유지'.",
+            "- 즉, 신규 자동매매 봇 연결은 D지만, 기존 DCA 적립은 TDE가 허용하면 '적립 유지'로 표시.",
+            "",
+            "[DCA 적립 원칙 — 반드시 준수]",
+            "- VOO/GOOGL/FCX는 장기 thesis 훼손 전까지 매일 DCA 적립 유지 원칙.",
+            "- 모델 정확도 저하, VIX 상승, RSI 약세, MACD 약세 등 단기 기술지표는 DCA 중단 사유가 아님.",
+            "- 이 종목들에 대해 '적립 보류', 'DCA 보류', '적립 중단'이라고 쓰지 말 것.",
+            "- 반드시 '적립 유지 / 목돈 매수 보류' 또는 'DCA 유지 / 신규 목돈 금지'로 표현할 것.",
+            "- 자동 적립 유지 가능 종목이 없다고 쓰지 말 것 — TDE가 허용하면 항상 있음.",
+            "",
             "- 오늘 신규 매수금액: 0원",
             f"- 손절/목표/RR 표시 가능: {_show_rr}  (False이면 미확정(stale) 또는 ?로 표시)",
             f"- 매수 전환 조건: {_buy_cond}",
             "- 이 기준은 신규 후보/스크리너/신규 목돈 매수/신규 자동매매 봇 연결 등급에만 적용한다.",
             "- 보유 종목 액션, 가격 조건 발동, 손실 제한 판단, 기존 DCA 자동 적립 판단에는 적용하지 않는다.",
             "- 기존 DCA 자동 적립 판단은 TDE 코드 결과를 우선한다.",
+            "- TDE/LLM 충돌 상태는 코드가 자동 판단해 하단에 추가함 — 본문에 '충돌 없음'이라고 쓰지 말 것.",
         ]
 
     return "\n".join(lines)
@@ -1266,6 +1275,88 @@ def _patch_usage_grade_rows(report: str, fdc: dict) -> str:
     else:
         print(f"  [FDC-PATCH] 상단 등급 표 {_total_patched}행 보정 완료", flush=True)
 
+    return "\n".join(patched)
+
+
+def _patch_dca_rows(report: str, tde_results: list) -> str:
+    """
+    LLM이 VOO/GOOGL/FCX에 대해 '적립 보류'처럼 잘못 쓴 표현을 TDE 결과 기준으로 보정.
+    '자동 적립 유지 가능 종목: 없음' 오류도 수정.
+    TDE에서 DCA가 허용된 종목에만 적용.
+    """
+    dca_allowed_names = [
+        t["name"] for t in (tde_results or [])
+        if t["trade_eligibility"]["buy_type"]["auto_dca_allowed"]
+    ]
+    if not dca_allowed_names:
+        return report
+
+    _DCA_DISPLAY = ", ".join(dca_allowed_names)
+    _WRONG_PATTERNS = [
+        ("자동 적립 유지 가능 종목: 없음", f"자동 적립(DCA) 유지 가능: {_DCA_DISPLAY} (장기 thesis 훼손 전까지 유지 원칙)"),
+        ("자동 적립 유지 가능 종목:없음", f"자동 적립(DCA) 유지 가능: {_DCA_DISPLAY} (장기 thesis 훼손 전까지 유지 원칙)"),
+        ("모델 신뢰도 미달로 적립도 보류", f"모델 신뢰도 기준 신규 목돈 매수 보류 (DCA는 {_DCA_DISPLAY} 유지)"),
+    ]
+    _TICKER_STRS = [
+        ("VOO 적립 보류",               "VOO DCA 유지 / 목돈 보류"),
+        ("GOOGL 적립 보류",             "GOOGL DCA 유지 / 목돈 보류"),
+        ("FCX 적립 보류",               "FCX DCA 유지 / 목돈 보류"),
+        ("알파벳A 적립 보류",           "알파벳A DCA 유지 / 목돈 보류"),
+        ("프리포트맥모란 적립 보류",    "프리포트맥모란 DCA 유지 / 목돈 보류"),
+        ("GOOGL/VOO/FCX 적립 보류",    "GOOGL/VOO/FCX DCA 유지 / 목돈 보류"),
+        ("VOO/FCX 적립 보류",          "VOO/FCX DCA 유지 / 목돈 보류"),
+        ("VOO/GOOGL/FCX 적립 보류",   "VOO/GOOGL/FCX DCA 유지 / 목돈 보류"),
+        ("GOOGL/VOO 적립 보류",        "GOOGL/VOO DCA 유지 / 목돈 보류"),
+        ("VOO DCA 보류",               "VOO DCA 유지 / 목돈 보류"),
+        ("GOOGL DCA 보류",             "GOOGL DCA 유지 / 목돈 보류"),
+        ("FCX DCA 보류",               "FCX DCA 유지 / 목돈 보류"),
+    ]
+    all_patterns = _WRONG_PATTERNS + _TICKER_STRS
+
+    patched = []
+    patch_count = 0
+    for line in report.splitlines():
+        original = line
+        for old, new in all_patterns:
+            if old in line:
+                line = line.replace(old, new)
+        if line != original:
+            patch_count += 1
+            print(f"  [DCA-PATCH] '{original.strip()[:70]}' → '{line.strip()[:70]}'", flush=True)
+        patched.append(line)
+
+    if patch_count > 0:
+        print(f"  [DCA-PATCH] DCA 표현 {patch_count}곳 보정 완료", flush=True)
+    return "\n".join(patched)
+
+
+def _patch_tde_conflict_in_body(report: str, conflict_count: int) -> str:
+    """
+    TDE/LLM 충돌이 실제로 있는데 LLM 본문에 '충돌 없음'이 쓰인 경우 보정.
+    보유 포트폴리오 관리 등급 기준 문구('정상 + 충돌 없음')는 건드리지 않음.
+    """
+    if conflict_count == 0:
+        return report
+    import re as _re
+    patched = []
+    patch_count = 0
+    for line in report.splitlines():
+        original = line
+        # "TDE/LLM 충돌: 없음" 또는 "TDE/LLM ... 충돌 없음" 패턴만 타게팅
+        # "보유 포트폴리오 관리 A: ... + 충돌 없음" 같은 포트폴리오 관리 문구는 제외
+        if ("충돌 없음" in line
+                and ("TDE" in line or "LLM" in line or "충돌 검증" in line)
+                and "보유 포트폴리오 관리" not in line):
+            line = line.replace(
+                "충돌 없음",
+                f"⚠️ 충돌 {conflict_count}건 감지 — 하단 TDE/LLM 충돌 검증 섹션 참고"
+            )
+        if line != original:
+            patch_count += 1
+            print(f"  [CONFLICT-PATCH] '{original.strip()[:70]}'", flush=True)
+        patched.append(line)
+    if patch_count:
+        print(f"  [CONFLICT-PATCH] TDE 충돌 상태 {patch_count}곳 보정", flush=True)
     return "\n".join(patched)
 
 
@@ -3872,8 +3963,9 @@ LLM은 신규 후보 표·수치를 직접 생성하지 마라. 현재가·RR·�
 (b) TDE 실전 매매 판단 결과:
 TDE 섹션은 코드가 계산한 결과이므로 LLM 본문 판단보다 우선. 임의 상향 금지.
 - 신규 목돈 매수 A/B 후보 수
-- 자동 적립 유지 가능 종목
+- 자동 적립 유지 가능 종목 (VOO/GOOGL/FCX는 장기 thesis 훼손 전까지 '적립 유지'로 표시)
 - 가격 조건 발동 종목 및 상태
+- TDE/LLM 충돌 상태: 코드 자동 판단 — 본문에 '충돌 없음'이라고 쓰지 말 것
 
 [섹션 9. 📌 최종 실행 플랜]
 📌 최종 실행 플랜
@@ -4567,6 +4659,13 @@ def run_daily_report():
     except Exception as _patch_e:
         print(f"  [FDC-PATCH][WARN] 후처리 실패: {_patch_e}", flush=True)
 
+    # DCA 표현 후처리 — VOO/GOOGL/FCX '적립 보류' 등 오류 표현 보정
+    try:
+        _tde_for_dca = tde_results if "tde_results" in dir() else []
+        report = _patch_dca_rows(report, _tde_for_dca)
+    except Exception as _dca_e:
+        print(f"  [DCA-PATCH][WARN] 후처리 실패: {_dca_e}", flush=True)
+
     # 목표가/손절가 portfolio.json에 자동 저장
     try:
         changed = False
@@ -4760,6 +4859,11 @@ def run_daily_report():
             # _fdc에 충돌 수 반영 (build_screener_report_section은 이미 호출됐으므로 하단 경고용)
             if isinstance(_fdc, dict):
                 _fdc["tde_llm_conflict_count"] = len(_conflicts)
+            # LLM 본문에 '충돌 없음'이 잘못 쓰인 경우 보정 (TDE/LLM 맥락에서만)
+            try:
+                report = _patch_tde_conflict_in_body(report, len(_conflicts))
+            except Exception as _tce:
+                print(f"  [CONFLICT-PATCH][WARN] 실패: {_tce}", flush=True)
             if _conflicts:
                 _conf_lines = [
                     "",
