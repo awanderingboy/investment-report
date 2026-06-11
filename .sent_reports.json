@@ -33,5 +33,10 @@
     "sent_at": "2026-06-11T12:30:58+09:00",
     "report_type": "manual_final_resend",
     "status": "sent"
+  },
+  "2026-06-12": {
+    "sent_at": "2026-06-12T07:17:46+09:00",
+    "report_type": "daily",
+    "status": "sent"
   }
 }
