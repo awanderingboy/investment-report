@@ -344,20 +344,37 @@ def _save_sent_reports(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def already_sent_today(report_type: str = "daily") -> bool:
-    """FORCE_SEND_REPORT=true이면 항상 False를 반환해 재발송을 허용한다."""
+    """
+    오늘 이미 보고서가 발송됐는지 확인한다.
+    - daily: 어떤 타입이든 오늘 이미 발송된 기록이 있으면 True (fail-safe)
+    - manual_final_resend: 동일 타입 기록이 있을 때만 True
+    - FORCE_SEND_REPORT=true이면 항상 False (bypass)
+    """
     if os.environ.get("FORCE_SEND_REPORT", "").lower() == "true":
         return False
     data = _load_sent_reports()
     today = _today_kst()
     entry = data.get(today, {})
-    return entry.get("report_type") == report_type and entry.get("status") == "sent"
+    if not entry or entry.get("status") != "sent":
+        return False
+    # daily_auto는 오늘 어떤 타입이든 발송 기록 있으면 차단
+    if report_type == "daily":
+        return True
+    # manual_final_resend는 동일 타입 기록이 있을 때만 차단 (하루 1회 제한)
+    return entry.get("report_type") == report_type
 
 def mark_sent_today(report_type: str = "daily") -> None:
     from datetime import timezone, timedelta as _td
     kst = timezone(_td(hours=9))
     sent_at = datetime.now(tz=kst).isoformat(timespec="seconds")
     data = _load_sent_reports()
-    data[_today_kst()] = {"sent_at": sent_at, "report_type": report_type, "status": "sent"}
+    data[_today_kst()] = {
+        "sent_at":    sent_at,
+        "report_type": report_type,
+        "status":     "sent",
+        "run_id":     os.environ.get("GITHUB_RUN_ID", "local"),
+        "event_name": os.environ.get("GITHUB_EVENT_NAME", "local"),
+    }
     _save_sent_reports(data)
 
 # ── Gmail IMAP 중복 체크 ──────────────────────────────────────────────────────
@@ -473,7 +490,11 @@ def gmail_report_exists_today(report_type: str = "daily") -> bool:
             print(f"  [SEND-GUARD][WARN] Gmail check attempt {_attempt+1}/3 failed: {e}", flush=True)
             if _attempt < 2:
                 _time.sleep(5)
-    print("  [SEND-GUARD][WARN] Gmail duplicate check failed after 3 attempts — allow send", flush=True)
+    # 3회 모두 실패: daily_auto는 fail-closed (발송 차단), manual은 fail-open (발송 허용)
+    if report_type == "daily":
+        print("  [SEND-GUARD] Gmail check 3회 실패 → daily_auto fail-closed: 발송 차단", flush=True)
+        return True   # True = "이미 발송됨" 처리 → daily_auto 스킵
+    print("  [SEND-GUARD][WARN] Gmail check 3회 실패 — manual 발송은 허용", flush=True)
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4930,17 +4951,20 @@ def run_daily_report():
     _manual_resend = os.environ.get("MANUAL_FINAL_RESEND", "").lower() == "true"
 
     if _manual_resend:
-        # 사용자 명시 요청에 의한 최종본 재발송 (1회만 허용)
-        print("  [SEND-GUARD] MANUAL_FINAL_RESEND=true — 오늘 최종본 재발송", flush=True)
-        send_email(
-            report,
-            subject_suffix=" 최종본",
-            body_prefix=(
-                "※ 오늘 중복 발송 오류 수정 후 재발송한 최종본입니다. "
-                "이전에 수신한 동일 날짜 보고서보다 이 보고서를 기준으로 확인하세요."
-            ),
-        )
-        mark_sent_today("manual_final_resend")
+        # 사용자 명시 요청에 의한 최종본 재발송 — 하루 1회만 허용
+        if already_sent_today("manual_final_resend"):
+            print("  [SEND-GUARD] manual_final_resend 오늘 이미 발송 — 하루 1회 제한 (스킵)", flush=True)
+        else:
+            print("  [SEND-GUARD] MANUAL_FINAL_RESEND=true — 오늘 최종본 재발송 (1회)", flush=True)
+            send_email(
+                report,
+                subject_suffix=" 최종본",
+                body_prefix=(
+                    "※ 오늘 중복 발송 오류 수정 후 재발송한 최종본입니다. "
+                    "이전에 수신한 동일 날짜 보고서보다 이 보고서를 기준으로 확인하세요."
+                ),
+            )
+            mark_sent_today("manual_final_resend")
     elif _force:
         print("  [SEND-GUARD] FORCE_SEND_REPORT=true — duplicate checks bypassed", flush=True)
         send_email(report)

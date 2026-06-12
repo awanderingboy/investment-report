@@ -11,6 +11,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: investment-report-daily-${{ github.ref }}
+  cancel-in-progress: false   # 먼저 실행 중인 것이 끝날 때까지 대기
+
 jobs:
   run-report:
     runs-on: ubuntu-latest
