@@ -45,5 +45,12 @@
     "sent_at": "2026-06-13T07:03:57+09:00",
     "report_type": "manual_final_resend",
     "status": "sent"
+  },
+  "2026-06-14": {
+    "sent_at": "2026-06-14T07:17:26+09:00",
+    "report_type": "daily",
+    "status": "sent",
+    "run_id": "27480660231",
+    "event_name": "workflow_dispatch"
   }
 }
