@@ -3229,15 +3229,20 @@ def detect_tde_llm_conflicts(report, tde_results, price_trigger_results=None):
 
     # 1. 신규 매수 가능 표현 충돌 (A/B 0개인데 매수 가능성 암시) — 라인 단위 검사
     # 같은 라인에 금지/불가/없음/보류/부적합/원칙적 단어가 있으면 충돌 아님
+    # "가능 수", "(매수 0)" 등 수량/검증 문구도 충돌 제외
     if ab_count == 0:
-        _DENY_WORDS_BUY = {"금지", "불가", "없음", "보류", "부적합", "원칙적"}
+        _DENY_WORDS_BUY = {
+            "금지", "불가", "없음", "보류", "부적합", "원칙적",
+            "가능 수", "매수 가능 수", "(매수 0)", "정상 (매수 0)",
+        }
         _POS_BUY_PATS = [
-            r"신규\s*매수\s*가능",                      # "신규 매수 가능 여부: 제한적" 포함
+            r"신규\s*매수\s*가능(?!\s*수)",             # "신규 매수 가능 수"는 제외, 나머지는 충돌
             r"신규\s*매수[^\n]{0,20}제한적",            # "신규 매수 가능 여부: 제한적" 변형 대응
             r"제한적\s*매수",
             r"신규\s*매수\s*(?:허용|검토)",
             r"신규\s*진입\s*\d+%\s*축소",
             r"신규\s*진입\s*가능",
+            r"(?:일부|분할|소액)\s*매수\s*(?:가능|허용|검토)",  # "일부/분할/소액 매수 가능" 포함
         ]
         for _line in report.splitlines():
             if any(_dw in _line for _dw in _DENY_WORDS_BUY):
@@ -3403,11 +3408,13 @@ def detect_tde_llm_conflicts(report, tde_results, price_trigger_results=None):
             break
 
     # 7. 신규 목돈 매수 금지 상태인데 DCA와 구분 없이 매수 가능처럼 표현
+    # "가능 수", "(매수 0)" 등 수량/검증 문구는 제외
     if ab_count == 0:
+        _DENY_WORDS_R7 = {"금지", "불가", "DCA", "적립", "자동", "가능 수", "매수 가능 수", "(매수 0)", "정상 (매수 0)"}
         for _line in report.splitlines():
-            if any(_dw in _line for _dw in {"금지", "불가", "DCA", "적립", "자동"}):
+            if any(_dw in _line for _dw in _DENY_WORDS_R7):
                 continue
-            if _re.search(r"(신규\s*매수|목돈\s*매수)[^\n]{0,20}가능", _line):
+            if _re.search(r"(신규\s*매수|목돈\s*매수|일부\s*매수|분할\s*매수|소액\s*매수)[^\n]{0,20}가능(?!\s*수)", _line):
                 conflicts.append({
                     "type": "DCA/목돈 매수 미구분 충돌",
                     "detail": (
