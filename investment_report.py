@@ -54,6 +54,10 @@ INSIDER_TICKERS = ["NVDA", "GOOGL", "FCX", "PLTR", "BEAM", "PWFL", "VOO"]
 PORTFOLIO_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
 SENT_REPORTS_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sent_reports.json")
 FEAR_GREED_CACHE   = "/tmp/fear_greed_cache.json"
+SEND_LOCK_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".report_send_lock")
+
+# 동일 프로세스 내 send_email() 2회 이상 호출 방지 플래그
+_EMAIL_SENT_THIS_PROCESS: bool = False
 
 _HARDCODED_PORTFOLIO = {
     "cash": {"krw": 13585062, "usd": 3566},
@@ -330,6 +334,46 @@ def validate_candidate_metrics(candidate: dict) -> tuple:
     """
     verdict, issues = validate_candidate_reality(candidate)
     return (verdict == "통과", issues)
+
+
+def _try_acquire_send_lock(date_str: str, report_type: str) -> bool:
+    """
+    O_CREAT | O_EXCL 를 사용해 날짜+타입 기준 lock 파일을 원자적으로 생성한다.
+    POSIX 원자적 파일 생성: 동시에 여러 프로세스가 시도해도 반드시 1개만 성공.
+    Returns True if lock acquired (발송 가능), False if already locked (스킵).
+    lock 파일은 삭제하지 않음 — 오늘 하루 동안 발송 기록으로 유지.
+    """
+    try:
+        os.makedirs(SEND_LOCK_DIR, exist_ok=True)
+        lock_path = os.path.join(SEND_LOCK_DIR, f"{date_str}_{report_type}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        from datetime import timezone as _tz, timedelta as _td2
+        _kst2 = _tz(_td2(hours=9))
+        payload = json.dumps({
+            "date_kst":    date_str,
+            "report_type": report_type,
+            "run_id":      os.environ.get("GITHUB_RUN_ID", "local"),
+            "event_name":  os.environ.get("GITHUB_EVENT_NAME", "local"),
+            "commit":      os.environ.get("GITHUB_SHA", "local")[:8],
+            "pid":         os.getpid(),
+            "created_at":  datetime.now(tz=_kst2).isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=2)
+        os.write(fd, payload.encode("utf-8"))
+        os.close(fd)
+        print(f"  [SEND-LOCK] lock 획득 완료: {os.path.basename(lock_path)}", flush=True)
+        return True
+    except FileExistsError:
+        print(f"  [SEND-LOCK] lock 파일 이미 존재 — {date_str} {report_type} 발송 스킵", flush=True)
+        return False
+    except Exception as _le:
+        print(f"  [SEND-LOCK][WARN] lock 생성 실패: {_le} → fail-closed (발송 차단)", flush=True)
+        return False
+
+
+def _send_lock_exists(date_str: str, report_type: str) -> bool:
+    """오늘 날짜+타입 lock 파일이 이미 존재하는지 확인 (읽기 전용)."""
+    lock_path = os.path.join(SEND_LOCK_DIR, f"{date_str}_{report_type}.lock")
+    return os.path.exists(lock_path)
 
 
 def _load_sent_reports() -> dict:
@@ -4950,10 +4994,19 @@ def run_daily_report():
     _force        = os.environ.get("FORCE_SEND_REPORT", "").lower() == "true"
     _manual_resend = os.environ.get("MANUAL_FINAL_RESEND", "").lower() == "true"
 
+    global _EMAIL_SENT_THIS_PROCESS
+    _today_str = _today_kst()
+
     if _manual_resend:
-        # 사용자 명시 요청에 의한 최종본 재발송 — 하루 1회만 허용
-        if already_sent_today("manual_final_resend"):
+        # 하드락 레이어 1: 프로세스 플래그
+        if _EMAIL_SENT_THIS_PROCESS:
+            print("  [SEND-GUARD] 동일 프로세스 내 이미 발송 — 스킵", flush=True)
+        # 하드락 레이어 2: sent_reports.json (소프트)
+        elif already_sent_today("manual_final_resend"):
             print("  [SEND-GUARD] manual_final_resend 오늘 이미 발송 — 하루 1회 제한 (스킵)", flush=True)
+        # 하드락 레이어 3: lock 파일 (O_EXCL 원자적) — 최후 방어
+        elif not _try_acquire_send_lock(_today_str, "manual_final_resend"):
+            print("  [SEND-GUARD] manual lock 획득 실패 — 스킵", flush=True)
         else:
             print("  [SEND-GUARD] MANUAL_FINAL_RESEND=true — 오늘 최종본 재발송 (1회)", flush=True)
             send_email(
@@ -4964,17 +5017,31 @@ def run_daily_report():
                     "이전에 수신한 동일 날짜 보고서보다 이 보고서를 기준으로 확인하세요."
                 ),
             )
+            _EMAIL_SENT_THIS_PROCESS = True
             mark_sent_today("manual_final_resend")
+
     elif _force:
-        print("  [SEND-GUARD] FORCE_SEND_REPORT=true — duplicate checks bypassed", flush=True)
-        send_email(report)
-        mark_sent_today("daily")
+        print("  [SEND-GUARD] ⚠️ FORCE_SEND_REPORT=true — 경고: 모든 중복 방지 우회됨", flush=True)
+        if not _EMAIL_SENT_THIS_PROCESS:
+            send_email(report)
+            _EMAIL_SENT_THIS_PROCESS = True
+            mark_sent_today("daily")
+        else:
+            print("  [SEND-GUARD] 동일 프로세스 내 이미 발송 — 스킵", flush=True)
+
+    # daily_auto: 3중 가드 (sent_record + Gmail fail-closed + lock)
+    elif _EMAIL_SENT_THIS_PROCESS:
+        print("  [SEND-GUARD] 동일 프로세스 내 이미 발송 — 스킵", flush=True)
     elif already_sent_today("daily"):
         print("  [SEND-GUARD] already sent today — skip email", flush=True)
     elif gmail_report_exists_today("daily"):
         print("  [SEND-GUARD] Gmail already has today's report — skip email", flush=True)
+    elif not _try_acquire_send_lock(_today_str, "daily"):
+        # lock 파일 원자적 생성 실패 = 다른 프로세스가 이미 발송 중 또는 완료
+        print("  [SEND-GUARD] daily lock 획득 실패 — 중복 방지 (스킵)", flush=True)
     else:
         send_email(report)
+        _EMAIL_SENT_THIS_PROCESS = True
         mark_sent_today("daily")
 
     print(f"\n{'='*50}", flush=True)

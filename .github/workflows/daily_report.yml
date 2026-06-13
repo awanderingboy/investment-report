@@ -12,8 +12,8 @@ on:
         default: false
 
 concurrency:
-  group: investment-report-daily-${{ github.ref }}
-  cancel-in-progress: false   # 먼저 실행 중인 것이 끝날 때까지 대기
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # 선행 실행이 끝날 때까지 대기 (발송 후 sent_record 반영)
 
 jobs:
   run-report:

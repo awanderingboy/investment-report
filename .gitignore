@@ -5,3 +5,4 @@ __pycache__/
 run.log
 logs/
 outputs/
+.report_send_lock/
