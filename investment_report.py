@@ -1274,8 +1274,12 @@ def _screener_context_for_llm(screener_data) -> str:
             "[DCA 적립 원칙 — 반드시 준수]",
             "- VOO/GOOGL/FCX는 장기 thesis 훼손 전까지 매일 DCA 적립 유지 원칙.",
             "- 모델 정확도 저하, VIX 상승, RSI 약세, MACD 약세 등 단기 기술지표는 DCA 중단 사유가 아님.",
-            "- 이 종목들에 대해 '적립 보류', 'DCA 보류', '적립 중단'이라고 쓰지 말 것.",
+            "- 이 종목들에 대해 '적립 보류', 'DCA 보류', '적립 중단', '적립 일시 중단', '적립 재검토', 'DCA 중단'이라고 쓰지 말 것.",
+            "- 가격 이탈/하락/기술지표만으로 적립 중단·재검토 표현 절대 금지 — 장기 thesis 훼손 시에만 DCA 재검토 허용.",
             "- 반드시 '적립 유지 / 목돈 매수 보류' 또는 'DCA 유지 / 신규 목돈 금지'로 표현할 것.",
+            "- 실행표 조건 컬럼 예시: GOOGL → '350달러 이탈 시 장기 thesis 훼손 여부 점검, DCA는 유지'",
+            "- 실행표 조건 컬럼 예시: FCX → '60달러 이탈 시 구리/기업 thesis 훼손 여부 점검, DCA는 유지'",
+            "- 실행표 조건 컬럼 예시: VOO → '가격 하락은 DCA 중단 사유 아님, 장기 적립 유지'",
             "- 자동 적립 유지 가능 종목이 없다고 쓰지 말 것 — TDE가 허용하면 항상 있음.",
             "",
             "- 오늘 신규 매수금액: 0원",
@@ -1361,6 +1365,13 @@ def _patch_dca_rows(report: str, tde_results: list) -> str:
         ("자동 적립 유지 가능 종목: 없음", f"자동 적립(DCA) 유지 가능: {_DCA_DISPLAY} (장기 thesis 훼손 전까지 유지 원칙)"),
         ("자동 적립 유지 가능 종목:없음", f"자동 적립(DCA) 유지 가능: {_DCA_DISPLAY} (장기 thesis 훼손 전까지 유지 원칙)"),
         ("모델 신뢰도 미달로 적립도 보류", f"모델 신뢰도 기준 신규 목돈 매수 보류 (DCA는 {_DCA_DISPLAY} 유지)"),
+        # 실행표 조건 컬럼 — 보고서에서 실제 발견된 DCA 중단 문구 (정확 매치)
+        ("350달러 이탈 시 적립 일시 중단 검토", "350달러 이탈 시 장기 thesis 훼손 여부 점검, DCA는 유지"),
+        ("350달러 이탈 시 적립 중단 검토",      "350달러 이탈 시 장기 thesis 훼손 여부 점검, DCA는 유지"),
+        ("60달러 이탈 시 적립 재검토",           "60달러 이탈 시 구리/기업 thesis 훼손 여부 점검, DCA는 유지"),
+        ("60달러 이탈 시 적립 중단",             "60달러 이탈 시 구리/기업 thesis 훼손 여부 점검, DCA는 유지"),
+        ("670달러 이탈 시 적립 일시 중단 검토",  "670달러 이탈 시 장기 thesis 훼손 여부 점검, DCA는 유지"),
+        ("670달러 이탈 시 적립 재검토",          "670달러 이탈 시 장기 thesis 훼손 여부 점검, DCA는 유지"),
     ]
     _TICKER_STRS = [
         ("VOO 적립 보류",               "VOO DCA 유지 / 목돈 보류"),
@@ -1375,6 +1386,26 @@ def _patch_dca_rows(report: str, tde_results: list) -> str:
         ("VOO DCA 보류",               "VOO DCA 유지 / 목돈 보류"),
         ("GOOGL DCA 보류",             "GOOGL DCA 유지 / 목돈 보류"),
         ("FCX DCA 보류",               "FCX DCA 유지 / 목돈 보류"),
+        # 적립 중단/재검토 — ticker-specific (가격 이탈만으로 DCA 중단 금지)
+        ("GOOGL 적립 일시 중단",        "GOOGL — 장기 thesis 훼손 여부 점검, DCA는 유지"),
+        ("GOOGL 적립 재검토",           "GOOGL — 장기 thesis 훼손 여부 점검, DCA는 유지"),
+        ("GOOGL 적립 중단",             "GOOGL — 장기 thesis 훼손 여부 점검, DCA는 유지"),
+        ("GOOGL DCA 중단",              "GOOGL DCA 유지"),
+        ("FCX 적립 재검토",             "FCX — 구리/기업 thesis 훼손 여부 점검, DCA는 유지"),
+        ("FCX 적립 중단",               "FCX — 구리/기업 thesis 훼손 여부 점검, DCA는 유지"),
+        ("FCX 적립 일시 중단",          "FCX — 구리/기업 thesis 훼손 여부 점검, DCA는 유지"),
+        ("FCX DCA 중단",                "FCX DCA 유지"),
+        ("VOO 적립 재검토",             "VOO — 가격 하락은 DCA 중단 사유 아님, 장기 적립 유지"),
+        ("VOO 적립 중단",               "VOO — 가격 하락은 DCA 중단 사유 아님, 장기 적립 유지"),
+        ("VOO 적립 일시 중단",          "VOO — 가격 하락은 DCA 중단 사유 아님, 장기 적립 유지"),
+        ("VOO DCA 중단",                "VOO DCA 유지"),
+    ]
+    # ticker-aware 일반 패턴: GOOGL/FCX/VOO 가 포함된 행에서만 적용
+    # "DCA 중단"은 제외 — "가격 하락은 DCA 중단 사유 아님" 내부 치환 부작용 방지
+    _DCA_TICKER_KEYS = ("VOO", "GOOGL", "FCX", "알파벳A", "프리포트맥모란")
+    _DCA_STOP_GENERAL = [
+        ("적립 일시 중단 검토",  "thesis 훼손 여부 점검, DCA는 유지"),
+        ("적립 일시 중단",       "DCA 유지"),
     ]
     all_patterns = _WRONG_PATTERNS + _TICKER_STRS
 
@@ -1385,6 +1416,11 @@ def _patch_dca_rows(report: str, tde_results: list) -> str:
         for old, new in all_patterns:
             if old in line:
                 line = line.replace(old, new)
+        # DCA 종목 행에서만 일반 DCA 중단 패턴 추가 치환 (비-DCA 종목 영향 방지)
+        if any(tk in line for tk in _DCA_TICKER_KEYS):
+            for old, new in _DCA_STOP_GENERAL:
+                if old in line:
+                    line = line.replace(old, new)
         if line != original:
             patch_count += 1
             print(f"  [DCA-PATCH] '{original.strip()[:70]}' → '{line.strip()[:70]}'", flush=True)
