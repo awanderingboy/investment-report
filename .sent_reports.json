@@ -73,5 +73,12 @@
     "status": "sent",
     "run_id": "27631444781",
     "event_name": "schedule"
+  },
+  "2026-06-18": {
+    "sent_at": "2026-06-18T07:16:46+09:00",
+    "report_type": "daily",
+    "status": "sent",
+    "run_id": "27723114744",
+    "event_name": "workflow_dispatch"
   }
 }
