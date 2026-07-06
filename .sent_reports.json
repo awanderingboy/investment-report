@@ -206,5 +206,12 @@
     "status": "sent",
     "run_id": "28758331820",
     "event_name": "schedule"
+  },
+  "2026-07-07": {
+    "sent_at": "2026-07-07T08:35:29+09:00",
+    "report_type": "daily",
+    "status": "sent",
+    "run_id": "28830474004",
+    "event_name": "schedule"
   }
 }
