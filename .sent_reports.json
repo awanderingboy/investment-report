@@ -318,5 +318,12 @@
     "status": "sent",
     "run_id": "34068155531",
     "event_name": "schedule"
+  },
+  "2026-09-08": {
+    "sent_at": "2026-09-08T09:28:57+09:00",
+    "report_type": "daily",
+    "status": "sent",
+    "run_id": "34173230358",
+    "event_name": "schedule"
   }
 }
