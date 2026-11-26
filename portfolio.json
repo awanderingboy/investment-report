@@ -2,14 +2,14 @@
   "exchange_rate_note": "달러 종목은 달러 기준으로 저장",
   "cash": {
     "krw": 8419062,
-    "usd": -5988
+    "usd": -6043
   },
   "category1": [
     {
       "ticker": "GOOGL",
       "name": "알파벳A",
-      "shares": 13.98027,
-      "avg_price": 341.6613,
+      "shares": 14.071812,
+      "avg_price": 341.2153,
       "currency": "USD",
       "daily_buy": 25,
       "dca_alert": true,
@@ -18,8 +18,8 @@
     {
       "ticker": "FCX",
       "name": "프리포트맥모란",
-      "shares": 31.7257,
-      "avg_price": 63.9873,
+      "shares": 31.931673,
+      "avg_price": 63.8877,
       "currency": "USD",
       "daily_buy": 10,
       "dca_alert": true,
@@ -28,8 +28,8 @@
     {
       "ticker": "VOO",
       "name": "VOO",
-      "shares": 6.961323,
-      "avg_price": 658.9978,
+      "shares": 6.991678,
+      "avg_price": 658.9972,
       "currency": "USD",
       "daily_buy": 20,
       "dca_alert": true,
@@ -121,7 +121,7 @@
   ],
   "category3": [],
   "last_updated": "2026-05-27",
-  "last_dca_date": "2026-11-25",
+  "last_dca_date": "2026-11-26",
   "pending_actions": [
     {
       "id": "nvda_split_buy_20260527",
